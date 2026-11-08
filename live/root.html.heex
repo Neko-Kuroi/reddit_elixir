@@ -1,0 +1,95 @@
+<!DOCTYPE html>
+<html lang="ja">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="csrf-token" content={get_csrf_token()} />
+    <.live_title suffix=" · reddit_clone">
+      <%= assigns[:page_title] || "reddit_clone" %>
+    </.live_title>
+    <link phx-track-static rel="stylesheet" href={~p"/assets/app.css"} />
+    <script defer phx-track-static type="text/javascript" src={~p"/assets/app.js"}>
+    </script>
+  </head>
+
+  <body class="bg-gray-100 min-h-screen">
+
+    <%!-- ナビゲーションバー --%>
+    <nav class="bg-white border-b border-gray-200 sticky top-0 z-30">
+      <div class="max-w-5xl mx-auto px-4 h-12 flex items-center gap-4">
+
+        <%!-- ロゴ --%>
+        <a href="/" class="flex items-center gap-1 shrink-0">
+          <span class="text-orange-500 text-xl font-black">🔴</span>
+          <span class="font-bold text-gray-800 hidden sm:block">reddit_clone</span>
+        </a>
+
+        <%!-- 検索フォーム --%>
+        <form action="/search" method="get" class="flex-1 max-w-xl">
+          <div class="relative">
+            <input
+              type="text"
+              name="q"
+              value={assigns[:query] || ""}
+              placeholder="検索..."
+              class="w-full border border-gray-300 rounded-full px-4 py-1.5 text-sm bg-gray-50 focus:outline-none focus:border-blue-400 focus:bg-white"
+            />
+            <button
+              type="submit"
+              class="absolute right-3 top-1/2 -translate-y-1/2 text-gray-400 hover:text-gray-600"
+            >
+              🔍
+            </button>
+          </div>
+        </form>
+
+        <%!-- 右側: 認証ボタン --%>
+        <div class="flex items-center gap-2 shrink-0">
+          <%= if @current_user do %>
+            <%!-- ログイン済み --%>
+            <a
+              href={"/u/#{@current_user.username}"}
+              class="text-sm text-gray-700 hover:text-blue-500 font-medium hidden sm:block"
+            >
+              u/<%= @current_user.username %>
+            </a>
+            <a
+              href="/subreddits/new"
+              class="text-sm text-gray-500 hover:text-gray-700 px-2 py-1 hidden sm:block"
+            >
+              ＋ 作成
+            </a>
+            <a
+              href="/logout"
+              data-method="delete"
+              class="text-sm border border-gray-300 rounded-full px-3 py-1 hover:bg-gray-50"
+            >
+              ログアウト
+            </a>
+          <% else %>
+            <%!-- 未ログイン --%>
+            <a
+              href="/login"
+              class="text-sm border border-blue-500 text-blue-500 rounded-full px-3 py-1 hover:bg-blue-50"
+            >
+              ログイン
+            </a>
+            <a
+              href="/register"
+              class="text-sm bg-blue-500 text-white rounded-full px-3 py-1 hover:bg-blue-600"
+            >
+              登録
+            </a>
+          <% end %>
+        </div>
+
+      </div>
+    </nav>
+
+    <%!-- メインコンテンツ --%>
+    <main>
+      <%= @inner_content %>
+    </main>
+
+  </body>
+</html>

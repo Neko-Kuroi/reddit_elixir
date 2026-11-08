@@ -67,8 +67,14 @@ defmodule RedditCloneWeb.SubredditLive do
          |> redirect(to: "/login")}
 
       user ->
-        Communities.join_subreddit(user.id, socket.assigns.subreddit.id)
-        {:noreply, assign(socket, :joined?, true)}
+        case Communities.join_subreddit(user.id, socket.assigns.subreddit.id) do
+          {:ok, _member} ->
+            {:noreply, assign(socket, :joined?, true)}
+
+          {:error, _changeset} ->
+            # 登録できなかった場合（すでに参加済みなど）は、実際の参加状態に合わせる
+            {:noreply, assign(socket, :joined?, joined?(user, socket.assigns.subreddit.id))}
+        end
     end
   end
 
@@ -283,6 +289,12 @@ defmodule RedditCloneWeb.SubredditLive do
          socket
          |> assign(:report_modal, nil)
          |> put_flash(:error, "自分のコンテンツは報告できません")}
+
+      {:error, :target_not_found} ->
+        {:noreply,
+         socket
+         |> assign(:report_modal, nil)
+         |> put_flash(:error, "報告対象が見つかりませんでした")}
 
       {:error, _changeset} ->
         {:noreply,

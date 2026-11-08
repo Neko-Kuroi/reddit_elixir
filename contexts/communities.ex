@@ -186,6 +186,16 @@ defmodule RedditClone.Communities do
       iex> moderator?(other_user_id, subreddit_id)
       false
   """
+  def moderator?(user_id, subreddit_id) do
+    from(m in SubredditMember,
+      where:
+        m.user_id == ^user_id and
+          m.subreddit_id == ^subreddit_id and
+          m.role == "moderator"
+    )
+    |> Repo.exists?()
+  end
+
   # ----------------------------------------------------------------
   # ⑧ Subredditを検索する
   # ----------------------------------------------------------------

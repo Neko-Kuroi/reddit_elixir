@@ -14,6 +14,7 @@ defmodule RedditClone.Reports do
   @doc """
   投稿またはコメントを報告する。
   自分のコンテンツは報告できない。
+  対象が存在しない場合は `{:error, :target_not_found}` を返す。
 
   ## 例
       iex> create_report(%{
@@ -30,12 +31,18 @@ defmodule RedditClone.Reports do
   def create_report(attrs) do
     target_author_id = get_author_id(attrs["target_type"], attrs["target_id"])
 
-    if target_author_id == attrs["reporter_id"] do
-      {:error, :cannot_report_own_content}
-    else
-      %Report{}
-      |> Report.changeset(attrs)
-      |> Repo.insert()
+    cond do
+      # 対象が存在しない（削除済み・不正な ID など）場合は報告を受け付けない
+      is_nil(target_author_id) ->
+        {:error, :target_not_found}
+
+      target_author_id == attrs["reporter_id"] ->
+        {:error, :cannot_report_own_content}
+
+      true ->
+        %Report{}
+        |> Report.changeset(attrs)
+        |> Repo.insert()
     end
   end
 

@@ -1,7 +1,7 @@
 defmodule RedditCloneWeb.Components.ReportModal do
   @moduledoc """
   投稿・コメントへの報告モーダル。
-  SubredditLive と PostLive から使う。
+  SubredditLive / PostLive / HomeFeedLive / ProfileLive / SearchLive から使う。
   """
 
   use RedditCloneWeb, :html

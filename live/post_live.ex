@@ -365,6 +365,12 @@ defmodule RedditCloneWeb.PostLive do
          |> assign(:report_modal, nil)
          |> put_flash(:error, "自分のコンテンツは報告できません")}
 
+      {:error, :target_not_found} ->
+        {:noreply,
+         socket
+         |> assign(:report_modal, nil)
+         |> put_flash(:error, "報告対象が見つかりませんでした")}
+
       {:error, _changeset} ->
         {:noreply,
          socket

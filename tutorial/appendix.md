@@ -2,6 +2,17 @@
 
 ---
 
+## 全コード付録への案内
+
+実コードの全文は、自動生成の「全コード付録」に収録されています（正本のコードファイルから機械的に転記したもので、全文が一致することを照合済みです）。
+
+- [全コード付録 1 データ層（マイグレーション＋スキーマ）](appendix_code_01_data.md) — 第2〜3章
+- [全コード付録 2 Context 層](appendix_code_02_contexts.md) — 第4章
+- [全コード付録 3 Web 層（認証＋LiveView＋コンポーネント）](appendix_code_03_web.md) — 第5〜8章
+- [全コード付録 4 設定（mix.exs と第1章の生成ファイル）](appendix_code_04_config.md) — 第1章
+
+---
+
 ## 完成時のディレクトリ構造
 
 ```
@@ -131,6 +142,7 @@ reddit_clone/
 | `/login` | LoginLive | ログイン済みはリダイレクト |
 | `/subreddits/new` | NewSubredditLive | 必須 |
 | `/r/:name` | SubredditLive | 不要 |
+| `/r/:name/submit` | NewPostLive | 必須 |
 | `/r/:name/submit` | NewPostLive | 必須 |
 | `/r/:name/:post_id` | PostLive | 不要 |
 | `/u/:username` | ProfileLive | 不要 |

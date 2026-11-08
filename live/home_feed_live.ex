@@ -2,9 +2,11 @@ defmodule RedditCloneWeb.HomeFeedLive do
   use RedditCloneWeb, :live_view
 
   import RedditCloneWeb.Components.PostCard
+  import RedditCloneWeb.Components.ReportModal
 
   alias RedditClone.Communities
   alias RedditClone.Posts
+  alias RedditClone.Reports
 
   on_mount {RedditCloneWeb.UserAuth, :require_auth}
 
@@ -26,7 +28,8 @@ defmodule RedditCloneWeb.HomeFeedLive do
      |> assign(:sort, "hot")
      |> assign(:page, 1)
      |> assign(:has_more?, length(posts) == 25)
-     |> assign(:joined_subreddits, joined_subreddits)}
+     |> assign(:joined_subreddits, joined_subreddits)
+     |> assign(:report_modal, nil)}
   end
 
   # ----------------------------------------------------------------
@@ -173,6 +176,9 @@ defmodule RedditCloneWeb.HomeFeedLive do
       </div>
 
     </div>
+
+    <%!-- 報告モーダル --%>
+    <.report_modal report_modal={@report_modal} />
     """
   end
 
@@ -185,5 +191,60 @@ defmodule RedditCloneWeb.HomeFeedLive do
   end
   defp tab_class(_, _) do
     "px-4 py-1 rounded hover:bg-gray-100 text-sm text-gray-600"
+  end
+
+  # 報告モーダルを開く
+  def handle_event("open_report_modal", %{"type" => type, "id" => id}, socket) do
+    case socket.assigns.current_user do
+      nil ->
+        {:noreply,
+         socket
+         |> put_flash(:error, "報告するにはログインが必要です")
+         |> redirect(to: "/login")}
+
+      _ ->
+        {:noreply, assign(socket, :report_modal, %{target_type: type, target_id: id})}
+    end
+  end
+
+  # 報告モーダルを閉じる
+  def handle_event("close_report_modal", _params, socket) do
+    {:noreply, assign(socket, :report_modal, nil)}
+  end
+
+  # 報告を送信する
+  def handle_event("submit_report", params, socket) do
+    attrs = %{
+      "reporter_id" => socket.assigns.current_user.id,
+      "target_type" => params["target_type"],
+      "target_id"   => params["target_id"],
+      "reason"      => params["reason"]
+    }
+
+    case Reports.create_report(attrs) do
+      {:ok, _report} ->
+        {:noreply,
+         socket
+         |> assign(:report_modal, nil)
+         |> put_flash(:info, "報告しました。ご協力ありがとうございます。")}
+
+      {:error, :cannot_report_own_content} ->
+        {:noreply,
+         socket
+         |> assign(:report_modal, nil)
+         |> put_flash(:error, "自分のコンテンツは報告できません")}
+
+      {:error, :target_not_found} ->
+        {:noreply,
+         socket
+         |> assign(:report_modal, nil)
+         |> put_flash(:error, "報告対象が見つかりませんでした")}
+
+      {:error, _changeset} ->
+        {:noreply,
+         socket
+         |> assign(:report_modal, nil)
+         |> put_flash(:error, "報告に失敗しました。もう一度お試しください。")}
+    end
   end
 end

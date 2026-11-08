@@ -2,6 +2,24 @@
 
 ---
 
+### この章で学ぶこと
+
+- 作るもの: 5つの Context（Accounts、Communities、Posts、Comments、Reports）。前編では Accounts と Communities、中編では Posts、後編では Comments と Reports を扱います
+- 学ぶ考え方: Context パターン、Ecto のクエリの組み立て方、関数の複数節とパターンマッチ、トランザクション、再帰によるツリー組み立て、`{:ok, _}` / `{:error, _}` の戻り値の約束
+
+### 前提
+
+- 第3章が済んでいること（7つのスキーマとチェンジセットが書けていること）
+- 第2章のマイグレーションが実行済みで、テーブルが存在すること
+
+### 全体の中での位置
+
+この章は3層構造の真ん中、Context 層を作る章です。第3章のスキーマ（Data 層）を使って「アプリのルール」を実装し、第6章の画面（Web 層）はここで作る関数を呼ぶだけになります。ルールを置く場所をここ1か所に決めるのが、この章いちばんの目的です。
+
+> この章のコードについて: 実ファイルの各関数には `@doc`（関数の説明文）が付いています。本文では関数の本体に集中するため `@doc` は省略しています。`@doc` を含む全文は、全コード付録2（appendix_code_02_contexts.md）に収録しています。
+
+---
+
 ## 4-1　Context パターンとは
 
 Context とは**アプリのルールをまとめたモジュール**です。
@@ -31,6 +49,10 @@ Context（Posts）
 DB（PostgreSQL）
   └─ データを保存するだけ
 ```
+
+**読み解き**
+
+Context の見方をもう1つ加えます。Context の公開関数（`def` で書かれた関数）の一覧が、そのまま「このアプリにできる操作」の一覧になります。画面側は、内部でどんなテーブルをどう触るかを知らなくてよく、「どの Context の、どの関数を呼ぶか」だけを知っていれば済みます。この「表に見える関数の集まりが境界になる」という考え方が Context パターンです。第3章で学んだ `{:ok, _}` / `{:error, _}` のタプルも、この境界を越える戻り値の約束として使われます。
 
 ---
 
@@ -110,7 +132,7 @@ defmodule RedditClone.Accounts do
 end
 ```
 
-**解説**
+**読み解き**
 
 `login_user/2` の実装に注目してください。
 
@@ -135,6 +157,14 @@ Repo.update_all(inc: [{field, amount}])
 
 「取得して +1 して保存」ではなく、DB レベルで `UPDATE users SET post_karma = post_karma + 1` を実行します。複数の投票が同時に来ても Karma がずれません。
 
+もう1つ、この Context のコード全体に通じる書き方を押さえます。**関数の複数節とパターンマッチ**です。
+
+`verify_password/2` は2つの節（同じ名前の関数定義）からできています。第1引数が `%User{}` の形なら1節目、`nil` なら2節目が選ばれます。呼び出し側は「ユーザーがいるかどうか」を `if` で分岐しません。受け取る値の形そのものが振り分けになる、というのがパターンマッチの発想です。節は上から順に試され、当てはまった最初の節が実行されます。
+
+末尾の `karma_field/1` も同じ発想で、文字列 `"post"` と `"comment"` という値そのもので振り分けています。条件分岐を関数の頭に書くことで、本体は「その場合にやること」だけに集中できます。この書き方は中編の投票処理（`process_vote`）で本格的に使います。
+
+`update_karma/3` の中の `{1, [user]} =` という行もパターンマッチです。`Repo.update_all` は「更新した件数と、更新された行のリスト」というタプルを返すので、それをこの形で受けて `user` を取り出しています。「件数は必ず1件のはず」という前提を形で表明しているので、もし0件だった場合はその場でエラー（MatchError）になり、静かに間違いが進むのを防ぎます。
+
 ---
 
 ## 4-3　Communities Context
@@ -150,11 +180,13 @@ defmodule RedditClone.Communities do
   # Subreddit を作成する（作成者を moderator として登録）
   def create_subreddit(attrs) do
     Repo.transaction(fn ->
+      # Subredditを保存
       subreddit =
         %Subreddit{}
         |> Subreddit.changeset(attrs)
         |> Repo.insert!()
 
+      # 作成者をmoderatorとして登録
       %SubredditMember{}
       |> SubredditMember.changeset(%{
         user_id: subreddit.owner_id,
@@ -176,7 +208,8 @@ defmodule RedditClone.Communities do
   # Join 済みの Subreddit 一覧（サイドバー用）
   def list_joined_subreddits(user_id) do
     from(s in Subreddit,
-      join: m in SubredditMember, on: m.subreddit_id == s.id,
+      join: m in SubredditMember,
+        on: m.subreddit_id == s.id,
       where: m.user_id == ^user_id,
       order_by: [asc: s.name]
     )
@@ -199,12 +232,15 @@ defmodule RedditClone.Communities do
     subreddit = get_subreddit!(subreddit_id)
 
     if subreddit.owner_id == user_id do
+      # オーナーは脱退できない
       {:error, :owner_cannot_leave}
     else
-      member = Repo.get_by!(SubredditMember,
-        user_id: user_id,
-        subreddit_id: subreddit_id
-      )
+      member =
+        Repo.get_by!(SubredditMember,
+          user_id: user_id,
+          subreddit_id: subreddit_id
+        )
+
       Repo.delete(member)
     end
   end
@@ -222,8 +258,8 @@ defmodule RedditClone.Communities do
     from(m in SubredditMember,
       where:
         m.user_id == ^user_id and
-        m.subreddit_id == ^subreddit_id and
-        m.role == "moderator"
+          m.subreddit_id == ^subreddit_id and
+          m.role == "moderator"
     )
     |> Repo.exists?()
   end
@@ -231,6 +267,7 @@ defmodule RedditClone.Communities do
   # キーワードで Subreddit を検索する
   def search_subreddits(query) when is_binary(query) and query != "" do
     term = "%#{query}%"
+
     from(s in Subreddit,
       where: ilike(s.name, ^term) or ilike(s.description, ^term),
       order_by: [asc: s.name],
@@ -242,9 +279,9 @@ defmodule RedditClone.Communities do
 end
 ```
 
-**解説**
+**読み解き**
 
-`create_subreddit/1` は `Repo.transaction/1` でトランザクションを使います。
+`create_subreddit/1` は `Repo.transaction/1` でトランザクションを使います。トランザクションとは「複数の DB 操作をひとまとまりとして扱い、全部成功するか、全部無かったことにする」仕組みです。
 
 ```elixir
 Repo.transaction(fn ->
@@ -259,6 +296,12 @@ end)
 `member?/2` と `moderator?/2` は `Repo.exists?()` を使います。レコード全体を取得せず、存在確認だけを行うため効率的です。
 
 `search_subreddits/1` の `ilike` は大文字小文字を無視した部分一致検索です。`"Elixir"` で検索しても `"elixir"` がヒットします。
+
+クエリの組み立て方についても、ここでまとめておきます。この章の `from(...)` という書き方は、その場で DB に問い合わせるのではなく、まず「クエリ（問い合わせの内容を表す構造体）」を組み立てるだけです。実際に DB へ実行されるのは、組み上がったクエリが `Repo.all()`（一覧で取得）、`Repo.one()`（1件だけ取得）、`Repo.exists?()`（有無だけ確認）などに渡された瞬間です。「組み立てる」と「実行する」が分かれているので、`from` の結果を変数に入れて、条件によって付け足す、といった組み立てもできます。
+
+`where: m.user_id == ^user_id` の `^` は**ピン演算子**と呼びます。クエリの中で Elixir 側の変数の値を使うときの印で、「この場所には `user_id` の値を埋め込む」という意味です。クエリの中は通常の Elixir のコードとは少し違う世界で、列名（`m.user_id`）と外から来た値を区別するためにこの印が必要になります。付け忘れると、意図しない解釈をされてエラーになります。
+
+`search_subreddits/1` の1節目にある `when is_binary(query) and query != ""` は**ガード**と呼び、「引数が空でない文字列のときにだけ、この節を使う」という追加の条件です。条件に当てはまらない入力は、2節目の `search_subreddits(_)` が受け止めて `[]` を返します。`_` は「値は何でもよいし、使わない」という意味の印です。複数節とガードを組み合わせると、「想定した入力は本体で処理し、それ以外は入口で穏やかに返す」という形が作れます。
 
 ---
 

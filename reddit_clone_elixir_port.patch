@@ -1,0 +1,2227 @@
+diff --git a/contexts/accounts.ex b/contexts/accounts.ex
+index 7deb550..9b3965c 100644
+--- a/contexts/accounts.ex
++++ b/contexts/accounts.ex
+@@ -56,10 +56,28 @@ defmodule RedditClone.Accounts do
+       {:error, :invalid_credentials}
+   """
+   def login_user(email, password) do
+-    user = Repo.get_by(User, email: email)
++    user = get_user_by_email(email)
+     verify_password(user, password)
+   end
+ 
++  @doc """
++  emailでユーザーを取得する。
++  保存時の綴りは保持されるため（方式B）、照会は lower() で比較する。
++  そのため、登録時と違う大文字小文字で入力してもログインできる。
++
++  ## 例
++      iex> get_user_by_email("Alice@Example.com")
++      %User{email: "alice@example.com"}
++  """
++  def get_user_by_email(email) do
++    downcased = String.downcase(email)
++
++    from(u in User,
++      where: fragment("lower(?)", u.email) == ^downcased
++    )
++    |> Repo.one()
++  end
++
+   # ユーザーが存在してパスワードが一致する場合のみ成功
+   defp verify_password(%User{} = user, password) do
+     if Bcrypt.verify_pass(password, user.password_hash) do
+@@ -81,16 +99,25 @@ defmodule RedditClone.Accounts do
+ 
+   @doc """
+   usernameでユーザーを取得する（プロフィールページ用）。
++  保存時の綴りは保持されるため（方式B）、照会は lower() で比較する。
+ 
+   ## 例
+       iex> get_user_by_username("alice")
+       %User{}
+ 
++      iex> get_user_by_username("ALICE")
++      %User{username: "Alice"}
++
+       iex> get_user_by_username("nobody")
+       nil
+   """
+   def get_user_by_username(username) do
+-    Repo.get_by(User, username: username)
++    downcased = String.downcase(username)
++
++    from(u in User,
++      where: fragment("lower(?)", u.username) == ^downcased
++    )
++    |> Repo.one()
+   end
+ 
+   @doc """
+diff --git a/contexts/comments.ex b/contexts/comments.ex
+index d73e73b..90b34d8 100644
+--- a/contexts/comments.ex
++++ b/contexts/comments.ex
+@@ -29,9 +29,37 @@ defmodule RedditClone.Comments do
+       {:error, %Ecto.Changeset{}}
+   """
+   def create_comment(attrs) do
+-    %Comment{}
+-    |> Comment.changeset(attrs)
+-    |> Repo.insert()
++    changeset = Comment.changeset(%Comment{}, attrs)
++
++    case validate_parent(changeset) do
++      :ok -> Repo.insert(changeset)
++      {:error, changeset} -> {:error, changeset}
++    end
++  end
++
++  # 返信先（parent_id）がある場合は、そのコメントが存在し、
++  # 同じ投稿へのコメントであることを確認する。
++  # parent_id はクライアントから送られてくる値なので、改ざんされたIDで
++  # 外部キーエラーになって落ちたり、別の投稿のコメントを親にして
++  # 表示されないコメントができたりするのを防ぐ。
++  defp validate_parent(changeset) do
++    case Ecto.Changeset.get_field(changeset, :parent_id) do
++      nil ->
++        :ok
++
++      parent_id ->
++        post_id = Ecto.Changeset.get_field(changeset, :post_id)
++
++        case Repo.get(Comment, parent_id) do
++          %Comment{post_id: ^post_id} ->
++            :ok
++
++          _ ->
++            changeset
++            |> Ecto.Changeset.add_error(:parent_id, "is invalid")
++            |> then(&{:error, &1})
++        end
++    end
+   end
+ 
+   # ----------------------------------------------------------------
+@@ -113,19 +141,28 @@ defmodule RedditClone.Comments do
+     if comment.author_id == user_id do
+       {:error, :cannot_vote_own_comment}
+     else
+-      existing_vote =
+-        Repo.get_by(Vote,
+-          user_id: user_id,
+-          target_type: "comment",
+-          target_id: comment_id
+-        )
+-
+       Repo.transaction(fn ->
++        # 既存の票はトランザクションの中で行ロックを取って読む
++        # （Posts.vote_post と同じ競合対策）
++        existing_vote = get_vote_for_update(user_id, "comment", comment_id)
++
+         process_vote(existing_vote, comment, user_id, value)
+       end)
+     end
+   end
+ 
++  # 既存の票を FOR UPDATE でロックして取得する（投票の競合防止）
++  defp get_vote_for_update(user_id, target_type, target_id) do
++    from(v in Vote,
++      where:
++        v.user_id == ^user_id and
++          v.target_type == ^target_type and
++          v.target_id == ^target_id,
++      lock: "FOR UPDATE"
++    )
++    |> Repo.one()
++  end
++
+   # パターンA: まだ投票していない → 新規投票
+   defp process_vote(nil, comment, user_id, value) do
+     %Vote{}
+@@ -157,12 +194,18 @@ defmodule RedditClone.Comments do
+   end
+ 
+   # score と comment_karma を同時に更新する
++  # score は SQL 側で加算する（inc）。読み込んだ値に足して書き戻すと
++  # 同時投票で更新が消えてしまうため（Posts.update_scores と同じ対策）。
+   defp update_scores(comment, score_diff, karma_diff) do
+-    updated_comment =
+-      comment
+-      |> Ecto.Changeset.change(score: comment.score + score_diff)
+-      |> Repo.update!()
+-      |> Repo.preload([:author])  # 投票後も author を保持する
++    {1, [updated_comment]} =
++      from(c in Comment,
++        where: c.id == ^comment.id,
++        select: c
++      )
++      |> Repo.update_all(inc: [score: score_diff])
++
++    # 投票後も author を保持する
++    updated_comment = Repo.preload(updated_comment, [:author])
+ 
+     # コメント投稿者の comment_karma を更新
+     Accounts.update_karma(comment.author_id, "comment", karma_diff)
+diff --git a/contexts/communities.ex b/contexts/communities.ex
+index 564944f..d0157ab 100644
+--- a/contexts/communities.ex
++++ b/contexts/communities.ex
+@@ -26,23 +26,27 @@ defmodule RedditClone.Communities do
+       {:error, %Ecto.Changeset{}}
+   """
+   def create_subreddit(attrs) do
++    changeset = Subreddit.changeset(%Subreddit{}, attrs)
++
+     Repo.transaction(fn ->
+-      # Subredditを保存
+-      subreddit =
+-        %Subreddit{}
+-        |> Subreddit.changeset(attrs)
+-        |> Repo.insert!()
+-
+-      # 作成者をmoderatorとして登録
+-      %SubredditMember{}
+-      |> SubredditMember.changeset(%{
+-        user_id: subreddit.owner_id,
+-        subreddit_id: subreddit.id,
+-        role: "moderator"
+-      })
+-      |> Repo.insert!()
+-
+-      subreddit
++      case Repo.insert(changeset) do
++        {:ok, subreddit} ->
++          # 作成者をmoderatorとして登録
++          %SubredditMember{}
++          |> SubredditMember.changeset(%{
++            user_id: subreddit.owner_id,
++            subreddit_id: subreddit.id,
++            role: "moderator"
++          })
++          |> Repo.insert!()
++
++          subreddit
++
++        {:error, changeset} ->
++          # 同名の同時作成などで一意制約に当たった場合は、
++          # 例外でプロセスを落とさず changeset のエラーとして返す
++          Repo.rollback(changeset)
++      end
+     end)
+   end
+ 
+@@ -52,16 +56,25 @@ defmodule RedditClone.Communities do
+ 
+   @doc """
+   nameでSubredditを取得する（URLの /r/:name から来る）。
++  保存時の綴りは保持されるため（方式B）、照会は lower() で比較する。
+ 
+   ## 例
+       iex> get_subreddit_by_name("elixir")
+       %Subreddit{}
+ 
++      iex> get_subreddit_by_name("ELIXIR")
++      %Subreddit{name: "Elixir"}
++
+       iex> get_subreddit_by_name("nothing")
+       nil
+   """
+   def get_subreddit_by_name(name) do
+-    Repo.get_by(Subreddit, name: name)
++    downcased = String.downcase(name)
++
++    from(s in Subreddit,
++      where: fragment("lower(?)", s.name) == ^downcased
++    )
++    |> Repo.one()
+   end
+ 
+   @doc """
+diff --git a/contexts/posts.ex b/contexts/posts.ex
+index 310f980..cc1a84e 100644
+--- a/contexts/posts.ex
++++ b/contexts/posts.ex
+@@ -74,27 +74,34 @@ defmodule RedditClone.Posts do
+   sort は "hot" または "new"。
+   1ページ25件。
+ 
++  戻り値は {投稿のリスト, 次のページがあるか} のタプル。
++  次ページの有無は、25件ちょうどかどうかではなく、
++  26件目が存在するかで判定する（多めに1件取って確認する）。
++
+   ## 例
+       iex> list_posts(subreddit_id, "hot", 1)
+-      [%Post{}, ...]
++      {[%Post{}, ...], true}
+ 
+       iex> list_posts(subreddit_id, "new", 2)
+-      [%Post{}, ...]
++      {[%Post{}, ...], false}
+   """
+   def list_posts(subreddit_id, sort \\ "hot", page \\ 1) do
+     offset = (page - 1) * @page_size
+ 
+-    from(p in Post,
+-      left_join: c in Comment, on: c.post_id == p.id,
+-      where: p.subreddit_id == ^subreddit_id,
+-      group_by: p.id,
+-      select_merge: %{comment_count: count(c.id)},
+-      preload: [:author, :subreddit],
+-      limit: @page_size,
+-      offset: ^offset
+-    )
+-    |> apply_sort(sort)
+-    |> Repo.all()
++    posts =
++      from(p in Post,
++        left_join: c in Comment, on: c.post_id == p.id,
++        where: p.subreddit_id == ^subreddit_id,
++        group_by: p.id,
++        select_merge: %{comment_count: count(c.id)},
++        preload: [:author, :subreddit],
++        limit: @page_size + 1,
++        offset: ^offset
++      )
++      |> apply_sort(sort)
++      |> Repo.all()
++
++    split_page(posts)
+   end
+ 
+   # ----------------------------------------------------------------
+@@ -104,59 +111,78 @@ defmodule RedditClone.Posts do
+   @doc """
+   ユーザーがJoinしているSubredditの投稿一覧を取得する。
+   ログインが必要（HomeFeedLive は require_auth で保護されている）。
++  戻り値は list_posts と同じ {投稿のリスト, 次のページがあるか} のタプル。
+ 
+   ## 例
+       iex> list_home_posts(user_id, "hot", 1)
+-      [%Post{}, ...]
++      {[%Post{}, ...], false}
+   """
+   def list_home_posts(user_id, sort \\ "hot", page \\ 1) do
+     offset = (page - 1) * @page_size
+ 
+-    from(p in Post,
+-      left_join: c in Comment, on: c.post_id == p.id,
+-      join: m in RedditClone.Communities.SubredditMember,
+-        on: m.subreddit_id == p.subreddit_id,
+-      where: m.user_id == ^user_id,
+-      group_by: p.id,
+-      select_merge: %{comment_count: count(c.id)},
+-      preload: [:author, :subreddit],
+-      limit: @page_size,
+-      offset: ^offset
+-    )
+-    |> apply_sort(sort)
+-    |> Repo.all()
++    posts =
++      from(p in Post,
++        left_join: c in Comment, on: c.post_id == p.id,
++        join: m in RedditClone.Communities.SubredditMember,
++          on: m.subreddit_id == p.subreddit_id,
++        where: m.user_id == ^user_id,
++        group_by: p.id,
++        select_merge: %{comment_count: count(c.id)},
++        preload: [:author, :subreddit],
++        limit: @page_size + 1,
++        offset: ^offset
++      )
++      |> apply_sort(sort)
++      |> Repo.all()
++
++    split_page(posts)
+   end
+ 
+   # ソートの適用（hot / new）
+-  defp apply_sort(query, "hot"), do: order_by(query, [p], desc: p.hot_score)
+-  defp apply_sort(query, "new"), do: order_by(query, [p], desc: p.inserted_at)
++  # 第1キーだけでは同点の投稿の順序が定まらず、ページ間で重複・欠落が出るため、
++  # inserted_at と id を第2・第3キーにして順序を安定させる。
++  defp apply_sort(query, "hot"),
++    do: order_by(query, [p], desc: p.hot_score, desc: p.inserted_at, desc: p.id)
++
++  defp apply_sort(query, "new"),
++    do: order_by(query, [p], desc: p.inserted_at, desc: p.id)
++
+   defp apply_sort(query, _),     do: apply_sort(query, "hot")
+ 
++  # @page_size + 1 件取った結果を、表示分と「次ページの有無」に分ける
++  defp split_page(rows) do
++    {Enum.take(rows, @page_size), length(rows) > @page_size}
++  end
++
+   # ----------------------------------------------------------------
+   # ⑤ ユーザーの投稿一覧を取得する（プロフィールページ用）
+   # ----------------------------------------------------------------
+ 
+   @doc """
+   指定ユーザーの投稿一覧を新着順で取得する。
++  戻り値は list_posts と同じ {投稿のリスト, 次のページがあるか} のタプル。
+ 
+   ## 例
+       iex> list_user_posts(user_id, 1)
+-      [%Post{}, ...]
++      {[%Post{}, ...], false}
+   """
+   def list_user_posts(user_id, page \\ 1) do
+     offset = (page - 1) * @page_size
+ 
+-    from(p in Post,
+-      left_join: c in Comment, on: c.post_id == p.id,
+-      where: p.author_id == ^user_id,
+-      group_by: p.id,
+-      select_merge: %{comment_count: count(c.id)},
+-      preload: [:author, :subreddit],
+-      order_by: [desc: p.inserted_at],
+-      limit: @page_size,
+-      offset: ^offset
+-    )
+-    |> Repo.all()
++    posts =
++      from(p in Post,
++        left_join: c in Comment, on: c.post_id == p.id,
++        where: p.author_id == ^user_id,
++        group_by: p.id,
++        select_merge: %{comment_count: count(c.id)},
++        preload: [:author, :subreddit],
++        order_by: [desc: p.inserted_at, desc: p.id],
++        limit: @page_size + 1,
++        offset: ^offset
++      )
++      |> Repo.all()
++
++    split_page(posts)
+   end
+ 
+   # ----------------------------------------------------------------
+@@ -186,19 +212,29 @@ defmodule RedditClone.Posts do
+       # パターンD: 自分の投稿には投票できない
+       {:error, :cannot_vote_own_post}
+     else
+-      existing_vote =
+-        Repo.get_by(Vote,
+-          user_id: user_id,
+-          target_type: "post",
+-          target_id: post_id
+-        )
+-
+       Repo.transaction(fn ->
++        # 既存の票はトランザクションの中で行ロックを取って読む。
++        # 外で読むと、同時に行われた変更・取り消しと競合して
++        # score と実際の票の合計がずれてしまう。
++        existing_vote = get_vote_for_update(user_id, "post", post_id)
++
+         process_vote(existing_vote, post, user_id, value)
+       end)
+     end
+   end
+ 
++  # 既存の票を FOR UPDATE でロックして取得する（投票の競合防止）
++  defp get_vote_for_update(user_id, target_type, target_id) do
++    from(v in Vote,
++      where:
++        v.user_id == ^user_id and
++          v.target_type == ^target_type and
++          v.target_id == ^target_id,
++      lock: "FOR UPDATE"
++    )
++    |> Repo.one()
++  end
++
+   # パターンA: まだ投票していない → 新規投票
+   defp process_vote(nil, post, user_id, value) do
+     %Vote{}
+@@ -231,15 +267,40 @@ defmodule RedditClone.Posts do
+   end
+ 
+   # score と hot_score と karma を同時に更新する
++  # score は SQL 側で加算し（inc）、hot_score も SQL の式で計算する。
++  # 読み込んだ post.score に足して書き戻すと、別々のユーザーが同時に
++  # 投票したときに一方の更新が消えてしまう（lost update）ため、
++  # 1文の原子的な UPDATE にする。
++  # hot_score の式は Post.compute_hot_score/2 と同じ
++  # （sign * log10(max(abs(score), 1)) + 経過秒数 / 45000）。
++  # PostgreSQL の log() は常用対数（底10）なので log10 として使える。
+   defp update_scores(post, score_diff, karma_diff) do
+-    new_score = post.score + score_diff
+-    new_hot   = Post.compute_hot_score(new_score, post.inserted_at)
+-
+-    updated_post =
+-      post
+-      |> Ecto.Changeset.change(score: new_score, hot_score: new_hot)
+-      |> Repo.update!()
+-      |> Repo.preload([:author, :subreddit])  # 投票後も author/subreddit を保持する
++    epoch_seconds = DateTime.to_unix(~U[2005-12-08 07:46:43Z])
++
++    {1, [updated_post]} =
++      from(p in Post,
++        where: p.id == ^post.id,
++        select: p,
++        update: [
++          inc: [score: ^score_diff],
++          set: [
++            hot_score:
++              fragment(
++                "sign(? + ?) * log(greatest(abs(? + ?), 1)) + (extract(epoch from ?) - ?) / 45000.0",
++                p.score,
++                ^score_diff,
++                p.score,
++                ^score_diff,
++                p.inserted_at,
++                ^epoch_seconds
++              )
++          ]
++        ]
++      )
++      |> Repo.update_all([])
++
++    # 投票後も author/subreddit を保持する
++    updated_post = Repo.preload(updated_post, [:author, :subreddit])
+ 
+     # 投稿者のKarmaも更新
+     Accounts.update_karma(post.author_id, "post", karma_diff)
+diff --git a/live/home_feed_live.ex b/live/home_feed_live.ex
+index c21252c..7fee62e 100644
+--- a/live/home_feed_live.ex
++++ b/live/home_feed_live.ex
+@@ -18,7 +18,7 @@ defmodule RedditCloneWeb.HomeFeedLive do
+   def mount(_params, _session, socket) do
+     user = socket.assigns.current_user
+ 
+-    posts            = Posts.list_home_posts(user.id, "hot", 1)
++    {posts, has_more?} = Posts.list_home_posts(user.id, "hot", 1)
+     joined_subreddits = Communities.list_joined_subreddits(user.id)
+ 
+     {:ok,
+@@ -27,7 +27,7 @@ defmodule RedditCloneWeb.HomeFeedLive do
+      |> assign(:posts, posts)
+      |> assign(:sort, "hot")
+      |> assign(:page, 1)
+-     |> assign(:has_more?, length(posts) == 25)
++     |> assign(:has_more?, has_more?)
+      |> assign(:joined_subreddits, joined_subreddits)
+      |> assign(:report_modal, nil)}
+   end
+@@ -38,26 +38,26 @@ defmodule RedditCloneWeb.HomeFeedLive do
+ 
+   @impl true
+   def handle_event("sort", %{"value" => sort}, socket) do
+-    user  = socket.assigns.current_user
+-    posts = Posts.list_home_posts(user.id, sort, 1)
++    user           = socket.assigns.current_user
++    {posts, has_more?} = Posts.list_home_posts(user.id, sort, 1)
+ 
+     {:noreply,
+      socket
+      |> assign(:sort, sort)
+      |> assign(:page, 1)
+-     |> assign(:has_more?, length(posts) == 25)
++     |> assign(:has_more?, has_more?)
+      |> assign(:posts, posts)}
+   end
+ 
+   def handle_event("load_more", _params, socket) do
+-    user      = socket.assigns.current_user
+-    next_page = socket.assigns.page + 1
+-    new_posts = Posts.list_home_posts(user.id, socket.assigns.sort, next_page)
++    user               = socket.assigns.current_user
++    next_page          = socket.assigns.page + 1
++    {new_posts, has_more?} = Posts.list_home_posts(user.id, socket.assigns.sort, next_page)
+ 
+     {:noreply,
+      socket
+      |> assign(:page, next_page)
+-     |> assign(:has_more?, length(new_posts) == 25)
++     |> assign(:has_more?, has_more?)
+      |> assign(:posts, socket.assigns.posts ++ new_posts)}
+   end
+ 
+diff --git a/live/profile_live.ex b/live/profile_live.ex
+index 1670571..9da2cec 100644
+--- a/live/profile_live.ex
++++ b/live/profile_live.ex
+@@ -24,7 +24,7 @@ defmodule RedditCloneWeb.ProfileLive do
+          |> redirect(to: "/")}
+ 
+       profile_user ->
+-        posts = Posts.list_user_posts(profile_user.id, 1)
++        {posts, has_more?} = Posts.list_user_posts(profile_user.id, 1)
+ 
+         {:ok,
+          socket
+@@ -32,7 +32,7 @@ defmodule RedditCloneWeb.ProfileLive do
+          |> assign(:profile_user, profile_user)
+          |> assign(:posts, posts)
+          |> assign(:page, 1)
+-         |> assign(:has_more?, length(posts) == 25)
++         |> assign(:has_more?, has_more?)
+          |> assign(:report_modal, nil)}
+     end
+   end
+@@ -43,13 +43,13 @@ defmodule RedditCloneWeb.ProfileLive do
+ 
+   @impl true
+   def handle_event("load_more", _params, socket) do
+-    next_page = socket.assigns.page + 1
+-    new_posts = Posts.list_user_posts(socket.assigns.profile_user.id, next_page)
++    next_page          = socket.assigns.page + 1
++    {new_posts, has_more?} = Posts.list_user_posts(socket.assigns.profile_user.id, next_page)
+ 
+     {:noreply,
+      socket
+      |> assign(:page, next_page)
+-     |> assign(:has_more?, length(new_posts) == 25)
++     |> assign(:has_more?, has_more?)
+      |> assign(:posts, socket.assigns.posts ++ new_posts)}
+   end
+ 
+diff --git a/live/subreddit_live.ex b/live/subreddit_live.ex
+index 03a66f7..67d208d 100644
+--- a/live/subreddit_live.ex
++++ b/live/subreddit_live.ex
+@@ -25,7 +25,7 @@ defmodule RedditCloneWeb.SubredditLive do
+          |> redirect(to: "/")}
+ 
+       subreddit ->
+-        posts   = Posts.list_posts(subreddit.id, "hot", 1)
++        {posts, has_more?} = Posts.list_posts(subreddit.id, "hot", 1)
+         joined? = joined?(socket.assigns.current_user, subreddit.id)
+ 
+         {:ok,
+@@ -35,7 +35,7 @@ defmodule RedditCloneWeb.SubredditLive do
+          |> assign(:posts, posts)
+          |> assign(:sort, "hot")
+          |> assign(:page, 1)
+-         |> assign(:has_more?, length(posts) == 25)
++         |> assign(:has_more?, has_more?)
+          |> assign(:report_modal, nil)
+          |> assign(:joined?, joined?)}
+     end
+@@ -48,13 +48,13 @@ defmodule RedditCloneWeb.SubredditLive do
+   @impl true
+   def handle_event("sort", %{"value" => sort}, socket) do
+     # ソート切り替え時はページを1に戻す
+-    posts = Posts.list_posts(socket.assigns.subreddit.id, sort, 1)
++    {posts, has_more?} = Posts.list_posts(socket.assigns.subreddit.id, sort, 1)
+ 
+     {:noreply,
+      socket
+      |> assign(:sort, sort)
+      |> assign(:page, 1)
+-     |> assign(:has_more?, length(posts) == 25)
++     |> assign(:has_more?, has_more?)
+      |> assign(:posts, posts)}
+   end
+ 
+@@ -92,13 +92,13 @@ defmodule RedditCloneWeb.SubredditLive do
+   end
+ 
+   def handle_event("load_more", _params, socket) do
+-    next_page  = socket.assigns.page + 1
+-    new_posts  = Posts.list_posts(socket.assigns.subreddit.id, socket.assigns.sort, next_page)
++    next_page          = socket.assigns.page + 1
++    {new_posts, has_more?} = Posts.list_posts(socket.assigns.subreddit.id, socket.assigns.sort, next_page)
+ 
+     {:noreply,
+      socket
+      |> assign(:page, next_page)
+-     |> assign(:has_more?, length(new_posts) == 25)
++     |> assign(:has_more?, has_more?)
+      |> assign(:posts, socket.assigns.posts ++ new_posts)}  # 既存に追記
+   end
+ 
+diff --git a/new/migrations/20240001000007_case_insensitive_uniqueness.exs b/migrations/20240001000007_case_insensitive_uniqueness.exs
+new file mode 100644
+index 0000000..057d9cb
+--- /dev/null
++++ b/migrations/20240001000007_case_insensitive_uniqueness.exs
+@@ -0,0 +1,16 @@
++defmodule RedditClone.Repo.Migrations.CaseInsensitiveUniqueness do
++  use Ecto.Migration
++
++  # 方式B: 表示用の綴りはそのまま保存し、一意性だけを lower() で担保する。
++  # "Alice" と "alice" のような大文字小文字違いの重複アカウントを防ぐため、
++  # 通常の一意インデックスを lower() の関数インデックスに置き換える。
++  def change do
++    drop unique_index(:users, [:username])
++    drop unique_index(:users, [:email])
++    drop unique_index(:subreddits, [:name])
++
++    create unique_index(:users, ["lower(username)"], name: :users_username_lower_index)
++    create unique_index(:users, ["lower(email)"], name: :users_email_lower_index)
++    create unique_index(:subreddits, ["lower(name)"], name: :subreddits_name_lower_index)
++  end
++end
+diff --git a/schemas/comment.ex b/schemas/comment.ex
+index 46a20eb..67f2491 100644
+--- a/schemas/comment.ex
++++ b/schemas/comment.ex
+@@ -23,6 +23,9 @@ defmodule RedditClone.Comments.Comment do
+     |> cast(attrs, [:body, :author_id, :post_id, :parent_id])
+     |> validate_required([:body, :author_id, :post_id])
+     |> validate_length(:body, min: 1, max: 10_000)
+-    # parent_id は nullable なのでバリデーション不要
++    # parent_id は nullable（トップレベルコメントでは nil）。
++    # 値がある場合は、存在しないIDで落ちないよう外部キー制約をエラーとして返す。
++    # 「同じ投稿のコメントか」の確認は Context（Comments.create_comment）で行う。
++    |> foreign_key_constraint(:parent_id)
+   end
+ end
+diff --git a/schemas/subreddit.ex b/schemas/subreddit.ex
+index 84b9bce..b2865d1 100644
+--- a/schemas/subreddit.ex
++++ b/schemas/subreddit.ex
+@@ -24,6 +24,7 @@ defmodule RedditClone.Communities.Subreddit do
+     |> validate_length(:name, min: 3, max: 21)
+     |> validate_format(:name, ~r/^[a-zA-Z0-9_]+$/)  # r/○○ の部分
+     |> validate_length(:description, max: 500)
+-    |> unique_constraint(:name)
++    # 一意性は lower() の関数インデックスで担保する（方式B）
++    |> unique_constraint(:name, name: :subreddits_name_lower_index)
+   end
+ end
+diff --git a/schemas/user.ex b/schemas/user.ex
+index 9e7704d..a53bb5b 100644
+--- a/schemas/user.ex
++++ b/schemas/user.ex
+@@ -30,8 +30,10 @@ defmodule RedditClone.Accounts.User do
+     |> validate_format(:username, ~r/^[a-zA-Z0-9_]+$/)   # 英数字とアンダースコアのみ
+     |> validate_format(:email, ~r/@/)
+     |> validate_length(:password, min: 8)
+-    |> unique_constraint(:username)
+-    |> unique_constraint(:email)
++    # 一意性は lower() の関数インデックスで担保する（方式B）。
++    # 表示用の綴りはそのまま保存し、大文字小文字違いの重複だけを防ぐ。
++    |> unique_constraint(:username, name: :users_username_lower_index)
++    |> unique_constraint(:email, name: :users_email_lower_index)
+     |> put_password_hash()
+   end
+ 
+diff --git a/tutorial/appendix.md b/tutorial/appendix.md
+index 14831e0..8f98cff 100644
+--- a/tutorial/appendix.md
++++ b/tutorial/appendix.md
+@@ -83,7 +83,8 @@ reddit_clone/
+   │           ├─ XXXXXX_create_posts.exs
+   │           ├─ XXXXXX_create_comments.exs
+   │           ├─ XXXXXX_create_votes.exs
+-  │           └─ XXXXXX_create_reports.exs
++  │           ├─ XXXXXX_create_reports.exs
++  │           └─ XXXXXX_case_insensitive_uniqueness.exs
+   │
+   ├─ config/
+   │   ├─ config.exs
+@@ -161,6 +162,7 @@ reddit_clone/
+ | `change_user_registration/1` | 空のチェンジセットを返す（フォーム初期化用） |
+ | `register_user/1` | ユーザーを登録する |
+ | `login_user/2` | メールとパスワードでログインする |
++| `get_user_by_email/1` | email でユーザーを取得する（大文字小文字を区別しない） |
+ | `get_user_by_username/1` | username でユーザーを取得する |
+ | `get_user!/1` | id でユーザーを取得する |
+ | `update_karma/3` | Karma を増減する |
+diff --git a/tutorial/appendix_code_01_data.md b/tutorial/appendix_code_01_data.md
+index 24332cd..2e23c62 100644
+--- a/tutorial/appendix_code_01_data.md
++++ b/tutorial/appendix_code_01_data.md
+@@ -196,6 +196,29 @@ defmodule RedditClone.Repo.Migrations.CreateReports do
+ end
+ ```
+ 
++## migrations/20240001000007_case_insensitive_uniqueness.exs（RedditClone.Repo.Migrations.CaseInsensitiveUniqueness）
++
++対応: 第2章。正本: `migrations/20240001000007_case_insensitive_uniqueness.exs`
++
++```elixir
++defmodule RedditClone.Repo.Migrations.CaseInsensitiveUniqueness do
++  use Ecto.Migration
++
++  # 方式B: 表示用の綴りはそのまま保存し、一意性だけを lower() で担保する。
++  # "Alice" と "alice" のような大文字小文字違いの重複アカウントを防ぐため、
++  # 通常の一意インデックスを lower() の関数インデックスに置き換える。
++  def change do
++    drop unique_index(:users, [:username])
++    drop unique_index(:users, [:email])
++    drop unique_index(:subreddits, [:name])
++
++    create unique_index(:users, ["lower(username)"], name: :users_username_lower_index)
++    create unique_index(:users, ["lower(email)"], name: :users_email_lower_index)
++    create unique_index(:subreddits, ["lower(name)"], name: :subreddits_name_lower_index)
++  end
++end
++```
++
+ ## schemas/comment.ex（RedditClone.Comments.Comment）
+ 
+ 対応: 第3章。正本: `schemas/comment.ex`
+@@ -226,7 +249,10 @@ defmodule RedditClone.Comments.Comment do
+     |> cast(attrs, [:body, :author_id, :post_id, :parent_id])
+     |> validate_required([:body, :author_id, :post_id])
+     |> validate_length(:body, min: 1, max: 10_000)
+-    # parent_id は nullable なのでバリデーション不要
++    # parent_id は nullable（トップレベルコメントでは nil）。
++    # 値がある場合は、存在しないIDで落ちないよう外部キー制約をエラーとして返す。
++    # 「同じ投稿のコメントか」の確認は Context（Comments.create_comment）で行う。
++    |> foreign_key_constraint(:parent_id)
+   end
+ end
+ ```
+@@ -385,7 +411,8 @@ defmodule RedditClone.Communities.Subreddit do
+     |> validate_length(:name, min: 3, max: 21)
+     |> validate_format(:name, ~r/^[a-zA-Z0-9_]+$/)  # r/○○ の部分
+     |> validate_length(:description, max: 500)
+-    |> unique_constraint(:name)
++    # 一意性は lower() の関数インデックスで担保する（方式B）
++    |> unique_constraint(:name, name: :subreddits_name_lower_index)
+   end
+ end
+ ```
+@@ -460,8 +487,10 @@ defmodule RedditClone.Accounts.User do
+     |> validate_format(:username, ~r/^[a-zA-Z0-9_]+$/)   # 英数字とアンダースコアのみ
+     |> validate_format(:email, ~r/@/)
+     |> validate_length(:password, min: 8)
+-    |> unique_constraint(:username)
+-    |> unique_constraint(:email)
++    # 一意性は lower() の関数インデックスで担保する（方式B）。
++    # 表示用の綴りはそのまま保存し、大文字小文字違いの重複だけを防ぐ。
++    |> unique_constraint(:username, name: :users_username_lower_index)
++    |> unique_constraint(:email, name: :users_email_lower_index)
+     |> put_password_hash()
+   end
+ 
+diff --git a/tutorial/appendix_code_02_contexts.md b/tutorial/appendix_code_02_contexts.md
+index 58dfbdd..f4c816d 100644
+--- a/tutorial/appendix_code_02_contexts.md
++++ b/tutorial/appendix_code_02_contexts.md
+@@ -72,10 +72,28 @@ defmodule RedditClone.Accounts do
+       {:error, :invalid_credentials}
+   """
+   def login_user(email, password) do
+-    user = Repo.get_by(User, email: email)
++    user = get_user_by_email(email)
+     verify_password(user, password)
+   end
+ 
++  @doc """
++  emailでユーザーを取得する。
++  保存時の綴りは保持されるため（方式B）、照会は lower() で比較する。
++  そのため、登録時と違う大文字小文字で入力してもログインできる。
++
++  ## 例
++      iex> get_user_by_email("Alice@Example.com")
++      %User{email: "alice@example.com"}
++  """
++  def get_user_by_email(email) do
++    downcased = String.downcase(email)
++
++    from(u in User,
++      where: fragment("lower(?)", u.email) == ^downcased
++    )
++    |> Repo.one()
++  end
++
+   # ユーザーが存在してパスワードが一致する場合のみ成功
+   defp verify_password(%User{} = user, password) do
+     if Bcrypt.verify_pass(password, user.password_hash) do
+@@ -97,16 +115,25 @@ defmodule RedditClone.Accounts do
+ 
+   @doc """
+   usernameでユーザーを取得する（プロフィールページ用）。
++  保存時の綴りは保持されるため（方式B）、照会は lower() で比較する。
+ 
+   ## 例
+       iex> get_user_by_username("alice")
+       %User{}
+ 
++      iex> get_user_by_username("ALICE")
++      %User{username: "Alice"}
++
+       iex> get_user_by_username("nobody")
+       nil
+   """
+   def get_user_by_username(username) do
+-    Repo.get_by(User, username: username)
++    downcased = String.downcase(username)
++
++    from(u in User,
++      where: fragment("lower(?)", u.username) == ^downcased
++    )
++    |> Repo.one()
+   end
+ 
+   @doc """
+@@ -185,9 +212,37 @@ defmodule RedditClone.Comments do
+       {:error, %Ecto.Changeset{}}
+   """
+   def create_comment(attrs) do
+-    %Comment{}
+-    |> Comment.changeset(attrs)
+-    |> Repo.insert()
++    changeset = Comment.changeset(%Comment{}, attrs)
++
++    case validate_parent(changeset) do
++      :ok -> Repo.insert(changeset)
++      {:error, changeset} -> {:error, changeset}
++    end
++  end
++
++  # 返信先（parent_id）がある場合は、そのコメントが存在し、
++  # 同じ投稿へのコメントであることを確認する。
++  # parent_id はクライアントから送られてくる値なので、改ざんされたIDで
++  # 外部キーエラーになって落ちたり、別の投稿のコメントを親にして
++  # 表示されないコメントができたりするのを防ぐ。
++  defp validate_parent(changeset) do
++    case Ecto.Changeset.get_field(changeset, :parent_id) do
++      nil ->
++        :ok
++
++      parent_id ->
++        post_id = Ecto.Changeset.get_field(changeset, :post_id)
++
++        case Repo.get(Comment, parent_id) do
++          %Comment{post_id: ^post_id} ->
++            :ok
++
++          _ ->
++            changeset
++            |> Ecto.Changeset.add_error(:parent_id, "is invalid")
++            |> then(&{:error, &1})
++        end
++    end
+   end
+ 
+   # ----------------------------------------------------------------
+@@ -269,19 +324,28 @@ defmodule RedditClone.Comments do
+     if comment.author_id == user_id do
+       {:error, :cannot_vote_own_comment}
+     else
+-      existing_vote =
+-        Repo.get_by(Vote,
+-          user_id: user_id,
+-          target_type: "comment",
+-          target_id: comment_id
+-        )
+-
+       Repo.transaction(fn ->
++        # 既存の票はトランザクションの中で行ロックを取って読む
++        # （Posts.vote_post と同じ競合対策）
++        existing_vote = get_vote_for_update(user_id, "comment", comment_id)
++
+         process_vote(existing_vote, comment, user_id, value)
+       end)
+     end
+   end
+ 
++  # 既存の票を FOR UPDATE でロックして取得する（投票の競合防止）
++  defp get_vote_for_update(user_id, target_type, target_id) do
++    from(v in Vote,
++      where:
++        v.user_id == ^user_id and
++          v.target_type == ^target_type and
++          v.target_id == ^target_id,
++      lock: "FOR UPDATE"
++    )
++    |> Repo.one()
++  end
++
+   # パターンA: まだ投票していない → 新規投票
+   defp process_vote(nil, comment, user_id, value) do
+     %Vote{}
+@@ -313,12 +377,18 @@ defmodule RedditClone.Comments do
+   end
+ 
+   # score と comment_karma を同時に更新する
++  # score は SQL 側で加算する（inc）。読み込んだ値に足して書き戻すと
++  # 同時投票で更新が消えてしまうため（Posts.update_scores と同じ対策）。
+   defp update_scores(comment, score_diff, karma_diff) do
+-    updated_comment =
+-      comment
+-      |> Ecto.Changeset.change(score: comment.score + score_diff)
+-      |> Repo.update!()
+-      |> Repo.preload([:author])  # 投票後も author を保持する
++    {1, [updated_comment]} =
++      from(c in Comment,
++        where: c.id == ^comment.id,
++        select: c
++      )
++      |> Repo.update_all(inc: [score: score_diff])
++
++    # 投票後も author を保持する
++    updated_comment = Repo.preload(updated_comment, [:author])
+ 
+     # コメント投稿者の comment_karma を更新
+     Accounts.update_karma(comment.author_id, "comment", karma_diff)
+@@ -397,23 +467,27 @@ defmodule RedditClone.Communities do
+       {:error, %Ecto.Changeset{}}
+   """
+   def create_subreddit(attrs) do
++    changeset = Subreddit.changeset(%Subreddit{}, attrs)
++
+     Repo.transaction(fn ->
+-      # Subredditを保存
+-      subreddit =
+-        %Subreddit{}
+-        |> Subreddit.changeset(attrs)
+-        |> Repo.insert!()
+-
+-      # 作成者をmoderatorとして登録
+-      %SubredditMember{}
+-      |> SubredditMember.changeset(%{
+-        user_id: subreddit.owner_id,
+-        subreddit_id: subreddit.id,
+-        role: "moderator"
+-      })
+-      |> Repo.insert!()
+-
+-      subreddit
++      case Repo.insert(changeset) do
++        {:ok, subreddit} ->
++          # 作成者をmoderatorとして登録
++          %SubredditMember{}
++          |> SubredditMember.changeset(%{
++            user_id: subreddit.owner_id,
++            subreddit_id: subreddit.id,
++            role: "moderator"
++          })
++          |> Repo.insert!()
++
++          subreddit
++
++        {:error, changeset} ->
++          # 同名の同時作成などで一意制約に当たった場合は、
++          # 例外でプロセスを落とさず changeset のエラーとして返す
++          Repo.rollback(changeset)
++      end
+     end)
+   end
+ 
+@@ -423,16 +497,25 @@ defmodule RedditClone.Communities do
+ 
+   @doc """
+   nameでSubredditを取得する（URLの /r/:name から来る）。
++  保存時の綴りは保持されるため（方式B）、照会は lower() で比較する。
+ 
+   ## 例
+       iex> get_subreddit_by_name("elixir")
+       %Subreddit{}
+ 
++      iex> get_subreddit_by_name("ELIXIR")
++      %Subreddit{name: "Elixir"}
++
+       iex> get_subreddit_by_name("nothing")
+       nil
+   """
+   def get_subreddit_by_name(name) do
+-    Repo.get_by(Subreddit, name: name)
++    downcased = String.downcase(name)
++
++    from(s in Subreddit,
++      where: fragment("lower(?)", s.name) == ^downcased
++    )
++    |> Repo.one()
+   end
+ 
+   @doc """
+@@ -674,27 +757,34 @@ defmodule RedditClone.Posts do
+   sort は "hot" または "new"。
+   1ページ25件。
+ 
++  戻り値は {投稿のリスト, 次のページがあるか} のタプル。
++  次ページの有無は、25件ちょうどかどうかではなく、
++  26件目が存在するかで判定する（多めに1件取って確認する）。
++
+   ## 例
+       iex> list_posts(subreddit_id, "hot", 1)
+-      [%Post{}, ...]
++      {[%Post{}, ...], true}
+ 
+       iex> list_posts(subreddit_id, "new", 2)
+-      [%Post{}, ...]
++      {[%Post{}, ...], false}
+   """
+   def list_posts(subreddit_id, sort \\ "hot", page \\ 1) do
+     offset = (page - 1) * @page_size
+ 
+-    from(p in Post,
+-      left_join: c in Comment, on: c.post_id == p.id,
+-      where: p.subreddit_id == ^subreddit_id,
+-      group_by: p.id,
+-      select_merge: %{comment_count: count(c.id)},
+-      preload: [:author, :subreddit],
+-      limit: @page_size,
+-      offset: ^offset
+-    )
+-    |> apply_sort(sort)
+-    |> Repo.all()
++    posts =
++      from(p in Post,
++        left_join: c in Comment, on: c.post_id == p.id,
++        where: p.subreddit_id == ^subreddit_id,
++        group_by: p.id,
++        select_merge: %{comment_count: count(c.id)},
++        preload: [:author, :subreddit],
++        limit: @page_size + 1,
++        offset: ^offset
++      )
++      |> apply_sort(sort)
++      |> Repo.all()
++
++    split_page(posts)
+   end
+ 
+   # ----------------------------------------------------------------
+@@ -704,59 +794,78 @@ defmodule RedditClone.Posts do
+   @doc """
+   ユーザーがJoinしているSubredditの投稿一覧を取得する。
+   ログインが必要（HomeFeedLive は require_auth で保護されている）。
++  戻り値は list_posts と同じ {投稿のリスト, 次のページがあるか} のタプル。
+ 
+   ## 例
+       iex> list_home_posts(user_id, "hot", 1)
+-      [%Post{}, ...]
++      {[%Post{}, ...], false}
+   """
+   def list_home_posts(user_id, sort \\ "hot", page \\ 1) do
+     offset = (page - 1) * @page_size
+ 
+-    from(p in Post,
+-      left_join: c in Comment, on: c.post_id == p.id,
+-      join: m in RedditClone.Communities.SubredditMember,
+-        on: m.subreddit_id == p.subreddit_id,
+-      where: m.user_id == ^user_id,
+-      group_by: p.id,
+-      select_merge: %{comment_count: count(c.id)},
+-      preload: [:author, :subreddit],
+-      limit: @page_size,
+-      offset: ^offset
+-    )
+-    |> apply_sort(sort)
+-    |> Repo.all()
++    posts =
++      from(p in Post,
++        left_join: c in Comment, on: c.post_id == p.id,
++        join: m in RedditClone.Communities.SubredditMember,
++          on: m.subreddit_id == p.subreddit_id,
++        where: m.user_id == ^user_id,
++        group_by: p.id,
++        select_merge: %{comment_count: count(c.id)},
++        preload: [:author, :subreddit],
++        limit: @page_size + 1,
++        offset: ^offset
++      )
++      |> apply_sort(sort)
++      |> Repo.all()
++
++    split_page(posts)
+   end
+ 
+   # ソートの適用（hot / new）
+-  defp apply_sort(query, "hot"), do: order_by(query, [p], desc: p.hot_score)
+-  defp apply_sort(query, "new"), do: order_by(query, [p], desc: p.inserted_at)
++  # 第1キーだけでは同点の投稿の順序が定まらず、ページ間で重複・欠落が出るため、
++  # inserted_at と id を第2・第3キーにして順序を安定させる。
++  defp apply_sort(query, "hot"),
++    do: order_by(query, [p], desc: p.hot_score, desc: p.inserted_at, desc: p.id)
++
++  defp apply_sort(query, "new"),
++    do: order_by(query, [p], desc: p.inserted_at, desc: p.id)
++
+   defp apply_sort(query, _),     do: apply_sort(query, "hot")
+ 
++  # @page_size + 1 件取った結果を、表示分と「次ページの有無」に分ける
++  defp split_page(rows) do
++    {Enum.take(rows, @page_size), length(rows) > @page_size}
++  end
++
+   # ----------------------------------------------------------------
+   # ⑤ ユーザーの投稿一覧を取得する（プロフィールページ用）
+   # ----------------------------------------------------------------
+ 
+   @doc """
+   指定ユーザーの投稿一覧を新着順で取得する。
++  戻り値は list_posts と同じ {投稿のリスト, 次のページがあるか} のタプル。
+ 
+   ## 例
+       iex> list_user_posts(user_id, 1)
+-      [%Post{}, ...]
++      {[%Post{}, ...], false}
+   """
+   def list_user_posts(user_id, page \\ 1) do
+     offset = (page - 1) * @page_size
+ 
+-    from(p in Post,
+-      left_join: c in Comment, on: c.post_id == p.id,
+-      where: p.author_id == ^user_id,
+-      group_by: p.id,
+-      select_merge: %{comment_count: count(c.id)},
+-      preload: [:author, :subreddit],
+-      order_by: [desc: p.inserted_at],
+-      limit: @page_size,
+-      offset: ^offset
+-    )
+-    |> Repo.all()
++    posts =
++      from(p in Post,
++        left_join: c in Comment, on: c.post_id == p.id,
++        where: p.author_id == ^user_id,
++        group_by: p.id,
++        select_merge: %{comment_count: count(c.id)},
++        preload: [:author, :subreddit],
++        order_by: [desc: p.inserted_at, desc: p.id],
++        limit: @page_size + 1,
++        offset: ^offset
++      )
++      |> Repo.all()
++
++    split_page(posts)
+   end
+ 
+   # ----------------------------------------------------------------
+@@ -786,19 +895,29 @@ defmodule RedditClone.Posts do
+       # パターンD: 自分の投稿には投票できない
+       {:error, :cannot_vote_own_post}
+     else
+-      existing_vote =
+-        Repo.get_by(Vote,
+-          user_id: user_id,
+-          target_type: "post",
+-          target_id: post_id
+-        )
+-
+       Repo.transaction(fn ->
++        # 既存の票はトランザクションの中で行ロックを取って読む。
++        # 外で読むと、同時に行われた変更・取り消しと競合して
++        # score と実際の票の合計がずれてしまう。
++        existing_vote = get_vote_for_update(user_id, "post", post_id)
++
+         process_vote(existing_vote, post, user_id, value)
+       end)
+     end
+   end
+ 
++  # 既存の票を FOR UPDATE でロックして取得する（投票の競合防止）
++  defp get_vote_for_update(user_id, target_type, target_id) do
++    from(v in Vote,
++      where:
++        v.user_id == ^user_id and
++          v.target_type == ^target_type and
++          v.target_id == ^target_id,
++      lock: "FOR UPDATE"
++    )
++    |> Repo.one()
++  end
++
+   # パターンA: まだ投票していない → 新規投票
+   defp process_vote(nil, post, user_id, value) do
+     %Vote{}
+@@ -831,15 +950,40 @@ defmodule RedditClone.Posts do
+   end
+ 
+   # score と hot_score と karma を同時に更新する
++  # score は SQL 側で加算し（inc）、hot_score も SQL の式で計算する。
++  # 読み込んだ post.score に足して書き戻すと、別々のユーザーが同時に
++  # 投票したときに一方の更新が消えてしまう（lost update）ため、
++  # 1文の原子的な UPDATE にする。
++  # hot_score の式は Post.compute_hot_score/2 と同じ
++  # （sign * log10(max(abs(score), 1)) + 経過秒数 / 45000）。
++  # PostgreSQL の log() は常用対数（底10）なので log10 として使える。
+   defp update_scores(post, score_diff, karma_diff) do
+-    new_score = post.score + score_diff
+-    new_hot   = Post.compute_hot_score(new_score, post.inserted_at)
+-
+-    updated_post =
+-      post
+-      |> Ecto.Changeset.change(score: new_score, hot_score: new_hot)
+-      |> Repo.update!()
+-      |> Repo.preload([:author, :subreddit])  # 投票後も author/subreddit を保持する
++    epoch_seconds = DateTime.to_unix(~U[2005-12-08 07:46:43Z])
++
++    {1, [updated_post]} =
++      from(p in Post,
++        where: p.id == ^post.id,
++        select: p,
++        update: [
++          inc: [score: ^score_diff],
++          set: [
++            hot_score:
++              fragment(
++                "sign(? + ?) * log(greatest(abs(? + ?), 1)) + (extract(epoch from ?) - ?) / 45000.0",
++                p.score,
++                ^score_diff,
++                p.score,
++                ^score_diff,
++                p.inserted_at,
++                ^epoch_seconds
++              )
++          ]
++        ]
++      )
++      |> Repo.update_all([])
++
++    # 投票後も author/subreddit を保持する
++    updated_post = Repo.preload(updated_post, [:author, :subreddit])
+ 
+     # 投稿者のKarmaも更新
+     Accounts.update_karma(post.author_id, "post", karma_diff)
+diff --git a/tutorial/appendix_code_03_web.md b/tutorial/appendix_code_03_web.md
+index 3b67ec0..9941c4a 100644
+--- a/tutorial/appendix_code_03_web.md
++++ b/tutorial/appendix_code_03_web.md
+@@ -967,7 +967,7 @@ defmodule RedditCloneWeb.HomeFeedLive do
+   def mount(_params, _session, socket) do
+     user = socket.assigns.current_user
+ 
+-    posts            = Posts.list_home_posts(user.id, "hot", 1)
++    {posts, has_more?} = Posts.list_home_posts(user.id, "hot", 1)
+     joined_subreddits = Communities.list_joined_subreddits(user.id)
+ 
+     {:ok,
+@@ -976,7 +976,7 @@ defmodule RedditCloneWeb.HomeFeedLive do
+      |> assign(:posts, posts)
+      |> assign(:sort, "hot")
+      |> assign(:page, 1)
+-     |> assign(:has_more?, length(posts) == 25)
++     |> assign(:has_more?, has_more?)
+      |> assign(:joined_subreddits, joined_subreddits)
+      |> assign(:report_modal, nil)}
+   end
+@@ -987,26 +987,26 @@ defmodule RedditCloneWeb.HomeFeedLive do
+ 
+   @impl true
+   def handle_event("sort", %{"value" => sort}, socket) do
+-    user  = socket.assigns.current_user
+-    posts = Posts.list_home_posts(user.id, sort, 1)
++    user           = socket.assigns.current_user
++    {posts, has_more?} = Posts.list_home_posts(user.id, sort, 1)
+ 
+     {:noreply,
+      socket
+      |> assign(:sort, sort)
+      |> assign(:page, 1)
+-     |> assign(:has_more?, length(posts) == 25)
++     |> assign(:has_more?, has_more?)
+      |> assign(:posts, posts)}
+   end
+ 
+   def handle_event("load_more", _params, socket) do
+-    user      = socket.assigns.current_user
+-    next_page = socket.assigns.page + 1
+-    new_posts = Posts.list_home_posts(user.id, socket.assigns.sort, next_page)
++    user               = socket.assigns.current_user
++    next_page          = socket.assigns.page + 1
++    {new_posts, has_more?} = Posts.list_home_posts(user.id, socket.assigns.sort, next_page)
+ 
+     {:noreply,
+      socket
+      |> assign(:page, next_page)
+-     |> assign(:has_more?, length(new_posts) == 25)
++     |> assign(:has_more?, has_more?)
+      |> assign(:posts, socket.assigns.posts ++ new_posts)}
+   end
+ 
+@@ -1922,7 +1922,7 @@ defmodule RedditCloneWeb.ProfileLive do
+          |> redirect(to: "/")}
+ 
+       profile_user ->
+-        posts = Posts.list_user_posts(profile_user.id, 1)
++        {posts, has_more?} = Posts.list_user_posts(profile_user.id, 1)
+ 
+         {:ok,
+          socket
+@@ -1930,7 +1930,7 @@ defmodule RedditCloneWeb.ProfileLive do
+          |> assign(:profile_user, profile_user)
+          |> assign(:posts, posts)
+          |> assign(:page, 1)
+-         |> assign(:has_more?, length(posts) == 25)
++         |> assign(:has_more?, has_more?)
+          |> assign(:report_modal, nil)}
+     end
+   end
+@@ -1941,13 +1941,13 @@ defmodule RedditCloneWeb.ProfileLive do
+ 
+   @impl true
+   def handle_event("load_more", _params, socket) do
+-    next_page = socket.assigns.page + 1
+-    new_posts = Posts.list_user_posts(socket.assigns.profile_user.id, next_page)
++    next_page          = socket.assigns.page + 1
++    {new_posts, has_more?} = Posts.list_user_posts(socket.assigns.profile_user.id, next_page)
+ 
+     {:noreply,
+      socket
+      |> assign(:page, next_page)
+-     |> assign(:has_more?, length(new_posts) == 25)
++     |> assign(:has_more?, has_more?)
+      |> assign(:posts, socket.assigns.posts ++ new_posts)}
+   end
+ 
+@@ -2497,7 +2497,7 @@ defmodule RedditCloneWeb.SubredditLive do
+          |> redirect(to: "/")}
+ 
+       subreddit ->
+-        posts   = Posts.list_posts(subreddit.id, "hot", 1)
++        {posts, has_more?} = Posts.list_posts(subreddit.id, "hot", 1)
+         joined? = joined?(socket.assigns.current_user, subreddit.id)
+ 
+         {:ok,
+@@ -2507,7 +2507,7 @@ defmodule RedditCloneWeb.SubredditLive do
+          |> assign(:posts, posts)
+          |> assign(:sort, "hot")
+          |> assign(:page, 1)
+-         |> assign(:has_more?, length(posts) == 25)
++         |> assign(:has_more?, has_more?)
+          |> assign(:report_modal, nil)
+          |> assign(:joined?, joined?)}
+     end
+@@ -2520,13 +2520,13 @@ defmodule RedditCloneWeb.SubredditLive do
+   @impl true
+   def handle_event("sort", %{"value" => sort}, socket) do
+     # ソート切り替え時はページを1に戻す
+-    posts = Posts.list_posts(socket.assigns.subreddit.id, sort, 1)
++    {posts, has_more?} = Posts.list_posts(socket.assigns.subreddit.id, sort, 1)
+ 
+     {:noreply,
+      socket
+      |> assign(:sort, sort)
+      |> assign(:page, 1)
+-     |> assign(:has_more?, length(posts) == 25)
++     |> assign(:has_more?, has_more?)
+      |> assign(:posts, posts)}
+   end
+ 
+@@ -2564,13 +2564,13 @@ defmodule RedditCloneWeb.SubredditLive do
+   end
+ 
+   def handle_event("load_more", _params, socket) do
+-    next_page  = socket.assigns.page + 1
+-    new_posts  = Posts.list_posts(socket.assigns.subreddit.id, socket.assigns.sort, next_page)
++    next_page          = socket.assigns.page + 1
++    {new_posts, has_more?} = Posts.list_posts(socket.assigns.subreddit.id, socket.assigns.sort, next_page)
+ 
+     {:noreply,
+      socket
+      |> assign(:page, next_page)
+-     |> assign(:has_more?, length(new_posts) == 25)
++     |> assign(:has_more?, has_more?)
+      |> assign(:posts, socket.assigns.posts ++ new_posts)}  # 既存に追記
+   end
+ 
+diff --git a/tutorial/chapter_02a.md b/tutorial/chapter_02a.md
+index acdce40..cc94944 100644
+--- a/tutorial/chapter_02a.md
++++ b/tutorial/chapter_02a.md
+@@ -149,6 +149,8 @@ end
+ 
+ `unique_index` で `username` と `email` の重複を DB レベルで防ぎます。アプリ側のバリデーションだけでは、同時リクエストで重複が起きる可能性があるためです。
+ 
++なお、この通常の `unique_index` は、後編の 2-12 で `lower()` の関数インデックスに置き換えます。大文字小文字違いの重複（`Alice` と `alice`）まで防ぐためです。ここではまず「一意インデックスで重複を防ぐ」という土台を作ります。
++
+ もう少しだけ深く見ます。`:binary_id` は、UUID をデータベースに保存するときの型の名前です。新しい行を保存すると、Ecto が UUID を自動で作って `id` に入れるので、コード側で採番する必要はありません。
+ 
+ `null: false` は「この列は空ではいけない」、`default: 0` は「値を指定しなかったときの最初の値」という指定です。この2つは似て非なるものです。`null: false` だけでは、空でなければ何でも入ってしまいますし、`default` だけでは、明示的に空を入れようとしたとき止められません。Karma のように「必ず数値で、最初は 0」という列には、両方を指定します。
+diff --git a/tutorial/chapter_02b.md b/tutorial/chapter_02b.md
+index 3a98b5d..06d85e1 100644
+--- a/tutorial/chapter_02b.md
++++ b/tutorial/chapter_02b.md
+@@ -210,6 +210,51 @@ psql -d reddit_clone_dev
+ 
+ ---
+ 
++## 2-12　追加マイグレーション： 大文字小文字の一意性（方式B）
++
++ここまでのマイグレーションで土台は完成していますが、後から追加するマイグレーションが1本あります。マイグレーションは「一度作って終わり」ではなく、必要になったときに新しいファイルを追加していくものだ、という例として読んでください。
++
++課題は、ユーザー名・メールアドレス・Subreddit 名の大文字小文字です。第2章で付けた通常の `unique_index` は文字列をそのまま比べるため、`Alice` と `alice` が別の値として扱われ、同じ人のつもりの重複アカウントが作れてしまいます。
++
++直し方には2通りあります。
++
++- **方式A**: 保存するときにすべて小文字化する。簡単ですが、表示でも大文字が消えてしまいます。
++- **方式B**: 表示用の綴りはそのまま保存し、一意性だけを `lower()`（小文字化した値）で担保する。Reddit 本家に近い方式です。
++
++この教材では **方式B** を選びます。`lower(username)` のような「式に対するインデックス」（関数インデックス）を作ることで、保存される値は `Alice` のままでも、`alice` での登録は重複として弾かれるようになります。
++
++```elixir
++# priv/repo/migrations/20240001000007_case_insensitive_uniqueness.exs
++defmodule RedditClone.Repo.Migrations.CaseInsensitiveUniqueness do
++  use Ecto.Migration
++
++  # 方式B: 表示用の綴りはそのまま保存し、一意性だけを lower() で担保する。
++  # "Alice" と "alice" のような大文字小文字違いの重複アカウントを防ぐため、
++  # 通常の一意インデックスを lower() の関数インデックスに置き換える。
++  def change do
++    drop unique_index(:users, [:username])
++    drop unique_index(:users, [:email])
++    drop unique_index(:subreddits, [:name])
++
++    create unique_index(:users, ["lower(username)"], name: :users_username_lower_index)
++    create unique_index(:users, ["lower(email)"], name: :users_email_lower_index)
++    create unique_index(:subreddits, ["lower(name)"], name: :subreddits_name_lower_index)
++  end
++end
++```
++
++**読み解き**
++
++インデックスの列に文字列 `"lower(username)"` を渡すと、その文字列が式としてそのまま SQL に使われます。これが関数インデックスです。値は小文字化されません。インデックス側だけが小文字化した値を持つ、というのがポイントです。
++
++インデックスには名前を付けています（`users_username_lower_index` など）。第3章のスキーマで `unique_constraint(..., name: ...)` と対応づけるためです。制約違反が起きたときに、どのインデックスへの違反かを Ecto が知らないと、例外として落ちてしまいます。名前をそろえることで、「重複しています」というフォームのエラーとして返せるようになります。
++
++注意点が1つあります。すでに実データのあるデータベースでこのマイグレーションを実行するとき、`Alice` と `alice` のような重複が既に存在すると、新しい一意インデックスを作る時点で失敗します。その場合は、先にどちらか一方へデータを寄せる（改名や統合をする）必要があります。教材のまっさらなデータベースでは問題になりません。
++
++この変更に合わせて、第3章のスキーマでは `unique_constraint` の名前を新しいインデックスに合わせ、第4章の照会（ログイン、プロフィール、`/r/:name`）では `lower()` で比較するようにします。表示側は元の綴りのままなので、画面の変更はありません。
++
++---
++
+ ## 動作確認（この章の仕上げ）
+ 
+ 前提は、PostgreSQL が起動していて、第1章でデータベースが作られていることです。
+diff --git a/tutorial/chapter_03a.md b/tutorial/chapter_03a.md
+index cd2524b..78f2f2e 100644
+--- a/tutorial/chapter_03a.md
++++ b/tutorial/chapter_03a.md
+@@ -128,8 +128,10 @@ defmodule RedditClone.Accounts.User do
+     |> validate_format(:username, ~r/^[a-zA-Z0-9_]+$/)   # 英数字とアンダースコアのみ
+     |> validate_format(:email, ~r/@/)
+     |> validate_length(:password, min: 8)
+-    |> unique_constraint(:username)
+-    |> unique_constraint(:email)
++    # 一意性は lower() の関数インデックスで担保する（方式B）。
++    # 表示用の綴りはそのまま保存し、大文字小文字違いの重複だけを防ぐ。
++    |> unique_constraint(:username, name: :users_username_lower_index)
++    |> unique_constraint(:email, name: :users_email_lower_index)
+     |> put_password_hash()
+   end
+ 
+@@ -193,7 +195,8 @@ defmodule RedditClone.Communities.Subreddit do
+     |> validate_length(:name, min: 3, max: 21)
+     |> validate_format(:name, ~r/^[a-zA-Z0-9_]+$/)  # r/○○ の部分
+     |> validate_length(:description, max: 500)
+-    |> unique_constraint(:name)
++    # 一意性は lower() の関数インデックスで担保する（方式B）
++    |> unique_constraint(:name, name: :subreddits_name_lower_index)
+   end
+ end
+ ```
+diff --git a/tutorial/chapter_03b.md b/tutorial/chapter_03b.md
+index 028cde9..8444c6a 100644
+--- a/tutorial/chapter_03b.md
++++ b/tutorial/chapter_03b.md
+@@ -136,7 +136,10 @@ defmodule RedditClone.Comments.Comment do
+     |> cast(attrs, [:body, :author_id, :post_id, :parent_id])
+     |> validate_required([:body, :author_id, :post_id])
+     |> validate_length(:body, min: 1, max: 10_000)
+-    # parent_id は nullable なのでバリデーション不要
++    # parent_id は nullable（トップレベルコメントでは nil）。
++    # 値がある場合は、存在しないIDで落ちないよう外部キー制約をエラーとして返す。
++    # 「同じ投稿のコメントか」の確認は Context（Comments.create_comment）で行う。
++    |> foreign_key_constraint(:parent_id)
+   end
+ end
+ ```
+@@ -157,6 +160,8 @@ has_many   :replies, RedditClone.Comments.Comment,  # 子コメント
+ 
+ `parent_id` は `validate_required` に含めていません。`nil` を許容することでトップレベルのコメントを表現するためです。
+ 
++なお、`parent_id` に値がある場合の確認は2段構えです。存在しないコメントIDが来た場合は、この `foreign_key_constraint` によって例外ではなくチェンジセットのエラーとして返ります。「存在はするが別の投稿のコメント」という場合までは外部キーでは分からないので、そちらは第4章の `Comments.create_comment` で事前に確認します。`parent_id` は画面から送られてくる値なので、改ざんされても落ちたり、別の投稿にぶら下がって表示されないコメントができたりしないようにするための備えです。
++
+ ---
+ 
+ ## 3-8　Vote スキーマ
+diff --git a/tutorial/chapter_04a.md b/tutorial/chapter_04a.md
+index af6eb08..dad58e3 100644
+--- a/tutorial/chapter_04a.md
++++ b/tutorial/chapter_04a.md
+@@ -92,13 +92,28 @@ defmodule RedditClone.Accounts do
+ 
+   # ログインする
+   def login_user(email, password) do
+-    user = Repo.get_by(User, email: email)
++    user = get_user_by_email(email)
+     verify_password(user, password)
+   end
+ 
+-  # username でユーザーを取得する（プロフィールページ用）
++  # email でユーザーを取得する（大文字小文字を区別しない）
++  def get_user_by_email(email) do
++    downcased = String.downcase(email)
++
++    from(u in User,
++      where: fragment("lower(?)", u.email) == ^downcased
++    )
++    |> Repo.one()
++  end
++
++  # username でユーザーを取得する（プロフィールページ用、大文字小文字を区別しない）
+   def get_user_by_username(username) do
+-    Repo.get_by(User, username: username)
++    downcased = String.downcase(username)
++
++    from(u in User,
++      where: fragment("lower(?)", u.username) == ^downcased
++    )
++    |> Repo.one()
+   end
+ 
+   def get_user!(id), do: Repo.get!(User, id)
+@@ -149,6 +164,8 @@ end
+ 
+ また失敗メッセージは「メールが違います」「パスワードが違います」と分けません。`{:error, :invalid_credentials}` のみを返します。どちらが間違っているかを教えると、攻撃者の手がかりになるためです。
+ 
++メールアドレスとユーザー名の照会には、もう1つ工夫があります。保存されている値は登録時の綴りのまま（`Alice@Example.com` のような大文字を含む形）なので、そのまま比べると、大文字小文字の違いだけで「見つからない」になってしまいます。そこで照会では `fragment("lower(?)", u.email)` のように DB 側で小文字化してから比べます。これは第2章 2-12 で入れた方式B（表示用の綴りは保存し、一意性は `lower()` のインデックスで担保する）の、読み取り側の対応です。登録したときと違う大文字小文字でログインしたり、`/u/ALICE` のような URL でプロフィールを開いたりしても、同じユーザーにたどり着けます。`fragment` は「Ecto のクエリ文法では書けない SQL の断片を、そのまま埋め込む」ための仕組みです。
++
+ `update_karma/3` は `Repo.update_all` を使って直接 DB で値を増減します。
+ 
+ ```elixir
+@@ -179,28 +196,38 @@ defmodule RedditClone.Communities do
+ 
+   # Subreddit を作成する（作成者を moderator として登録）
+   def create_subreddit(attrs) do
++    changeset = Subreddit.changeset(%Subreddit{}, attrs)
++
+     Repo.transaction(fn ->
+-      # Subredditを保存
+-      subreddit =
+-        %Subreddit{}
+-        |> Subreddit.changeset(attrs)
+-        |> Repo.insert!()
+-
+-      # 作成者をmoderatorとして登録
+-      %SubredditMember{}
+-      |> SubredditMember.changeset(%{
+-        user_id: subreddit.owner_id,
+-        subreddit_id: subreddit.id,
+-        role: "moderator"
+-      })
+-      |> Repo.insert!()
+-
+-      subreddit
++      case Repo.insert(changeset) do
++        {:ok, subreddit} ->
++          # 作成者をmoderatorとして登録
++          %SubredditMember{}
++          |> SubredditMember.changeset(%{
++            user_id: subreddit.owner_id,
++            subreddit_id: subreddit.id,
++            role: "moderator"
++          })
++          |> Repo.insert!()
++
++          subreddit
++
++        {:error, changeset} ->
++          # 同名の同時作成などで一意制約に当たった場合は、
++          # 例外でプロセスを落とさず changeset のエラーとして返す
++          Repo.rollback(changeset)
++      end
+     end)
+   end
+ 
++  # name で Subreddit を取得する（大文字小文字を区別しない）
+   def get_subreddit_by_name(name) do
+-    Repo.get_by(Subreddit, name: name)
++    downcased = String.downcase(name)
++
++    from(s in Subreddit,
++      where: fragment("lower(?)", s.name) == ^downcased
++    )
++    |> Repo.one()
+   end
+ 
+   def get_subreddit!(id), do: Repo.get!(Subreddit, id)
+@@ -283,16 +310,12 @@ end
+ 
+ `create_subreddit/1` は `Repo.transaction/1` でトランザクションを使います。トランザクションとは「複数の DB 操作をひとまとまりとして扱い、全部成功するか、全部無かったことにする」仕組みです。
+ 
+-```elixir
+-Repo.transaction(fn ->
+-  subreddit = Repo.insert!(...)   # Subreddit を保存
+-  Repo.insert!(...)               # Moderator として登録
+-  subreddit
+-end)
+-```
+-
+ 2つの操作をトランザクションで包むことで「Subreddit は作成されたが Moderator の登録は失敗した」という中途半端な状態を防ぎます。どちらかが失敗すると両方がロールバックされます。
+ 
++Subreddit 本体の保存に `Repo.insert!` ではなく `Repo.insert` を使っている点にも注目してください。同名の Subreddit を2人が同時に作ろうとすると、一意制約に当たることがあります。`insert!` はその場で例外を投げて LiveView のプロセスを落としてしまいますが、`insert` の `{:error, changeset}` を受けて `Repo.rollback(changeset)` すれば、トランザクション全体が `{:error, changeset}` を返す形になり、画面側は「名前が使われています」というフォームのエラーとして穏やかに扱えます。モデレーター登録のほうは、ここまで来れば通常失敗しない前提の内部処理なので、`insert!` のままにしています。
++
++`get_subreddit_by_name/1` も Accounts と同じく、`lower()` で比べて大文字小文字を区別しません（方式B）。`/r/Elixir` と入力しても、保存時の綴りが `Elixir` でも `elixir` でも、同じ Subreddit が見つかります。
++
+ `member?/2` と `moderator?/2` は `Repo.exists?()` を使います。レコード全体を取得せず、存在確認だけを行うため効率的です。
+ 
+ `search_subreddits/1` の `ilike` は大文字小文字を無視した部分一致検索です。`"Elixir"` で検索しても `"elixir"` がヒットします。
+diff --git a/tutorial/chapter_04b.md b/tutorial/chapter_04b.md
+index 316e706..5a447ab 100644
+--- a/tutorial/chapter_04b.md
++++ b/tutorial/chapter_04b.md
+@@ -43,56 +43,66 @@ defmodule RedditClone.Posts do
+   end
+ 
+   # Subreddit の投稿一覧を取得する
++  # 戻り値は {投稿のリスト, 次のページがあるか} のタプル
+   def list_posts(subreddit_id, sort \\ "hot", page \\ 1) do
+     offset = (page - 1) * @page_size
+ 
+-    from(p in Post,
+-      left_join: c in Comment, on: c.post_id == p.id,
+-      where: p.subreddit_id == ^subreddit_id,
+-      group_by: p.id,
+-      select_merge: %{comment_count: count(c.id)},
+-      preload: [:author, :subreddit],
+-      limit: @page_size,
+-      offset: ^offset
+-    )
+-    |> apply_sort(sort)
+-    |> Repo.all()
++    posts =
++      from(p in Post,
++        left_join: c in Comment, on: c.post_id == p.id,
++        where: p.subreddit_id == ^subreddit_id,
++        group_by: p.id,
++        select_merge: %{comment_count: count(c.id)},
++        preload: [:author, :subreddit],
++        limit: @page_size + 1,
++        offset: ^offset
++      )
++      |> apply_sort(sort)
++      |> Repo.all()
++
++    split_page(posts)
+   end
+ 
+   # ホーム Feed（Join 済みの投稿一覧）
+   def list_home_posts(user_id, sort \\ "hot", page \\ 1) do
+     offset = (page - 1) * @page_size
+ 
+-    from(p in Post,
+-      left_join: c in Comment, on: c.post_id == p.id,
+-      join: m in RedditClone.Communities.SubredditMember,
+-        on: m.subreddit_id == p.subreddit_id,
+-      where: m.user_id == ^user_id,
+-      group_by: p.id,
+-      select_merge: %{comment_count: count(c.id)},
+-      preload: [:author, :subreddit],
+-      limit: @page_size,
+-      offset: ^offset
+-    )
+-    |> apply_sort(sort)
+-    |> Repo.all()
++    posts =
++      from(p in Post,
++        left_join: c in Comment, on: c.post_id == p.id,
++        join: m in RedditClone.Communities.SubredditMember,
++          on: m.subreddit_id == p.subreddit_id,
++        where: m.user_id == ^user_id,
++        group_by: p.id,
++        select_merge: %{comment_count: count(c.id)},
++        preload: [:author, :subreddit],
++        limit: @page_size + 1,
++        offset: ^offset
++      )
++      |> apply_sort(sort)
++      |> Repo.all()
++
++    split_page(posts)
+   end
+ 
+   # ユーザーの投稿一覧（プロフィールページ用）
+   def list_user_posts(user_id, page \\ 1) do
+     offset = (page - 1) * @page_size
+ 
+-    from(p in Post,
+-      left_join: c in Comment, on: c.post_id == p.id,
+-      where: p.author_id == ^user_id,
+-      group_by: p.id,
+-      select_merge: %{comment_count: count(c.id)},
+-      preload: [:author, :subreddit],
+-      order_by: [desc: p.inserted_at],
+-      limit: @page_size,
+-      offset: ^offset
+-    )
+-    |> Repo.all()
++    posts =
++      from(p in Post,
++        left_join: c in Comment, on: c.post_id == p.id,
++        where: p.author_id == ^user_id,
++        group_by: p.id,
++        select_merge: %{comment_count: count(c.id)},
++        preload: [:author, :subreddit],
++        order_by: [desc: p.inserted_at, desc: p.id],
++        limit: @page_size + 1,
++        offset: ^offset
++      )
++      |> Repo.all()
++
++    split_page(posts)
+   end
+ 
+   # キーワードで投稿を検索する
+@@ -112,9 +122,17 @@ defmodule RedditClone.Posts do
+   end
+   def search_posts(_), do: []
+ 
+-  defp apply_sort(query, "hot"), do: order_by(query, [p], desc: p.hot_score)
+-  defp apply_sort(query, "new"), do: order_by(query, [p], desc: p.inserted_at)
++  # 第1キーだけでは同点の順序が定まらないため、inserted_at と id を続けて指定する
++  defp apply_sort(query, "hot"),
++    do: order_by(query, [p], desc: p.hot_score, desc: p.inserted_at, desc: p.id)
++  defp apply_sort(query, "new"),
++    do: order_by(query, [p], desc: p.inserted_at, desc: p.id)
+   defp apply_sort(query, _),     do: apply_sort(query, "hot")
++
++  # @page_size + 1 件取った結果を、表示分と「次ページの有無」に分ける
++  defp split_page(rows) do
++    {Enum.take(rows, @page_size), length(rows) > @page_size}
++  end
+ end
+ ```
+ 
+@@ -129,7 +147,7 @@ from(p in Post,
+   group_by: p.id,                                   # 投稿ごとに集計
+   select_merge: %{comment_count: count(c.id)},      # コメント数を追加
+   preload: [:author, :subreddit],
+-  limit: @page_size,
++  limit: @page_size + 1,
+   offset: ^offset
+ )
+ ```
+@@ -140,6 +158,12 @@ from(p in Post,
+ 
+ `preload: [:author, :subreddit]` は、取得した投稿に紐づく著者とコミュニティを、まとめて読み込んでおく指定です。これが無いと、画面で `post.author.username` のように触れたときに「読み込み忘れ」として扱われ、表示のたびに1件ずつ DB へ聞きに行く事態（通称 N+1 問題。件数が増えるほどクエリが増える）や、未読み込みエラー（`Ecto.Association.NotLoaded`）の原因になります。一覧を出すクエリでは「画面で何を表示するか」を見越して preload するのが決まりです。
+ 
++一覧の並び順とページ送りには、2つの備えが入っています。
++
++1つ目は `apply_sort` の**第2・第3の並びキー**です。Hot 順の第1キーは `hot_score` ですが、同点の投稿同士の順序はこれだけでは決まりません。順序が決まらない行があると、ページをまたいだときに「同じ投稿が2回出る」「一部の投稿がどのページにも出ない」ということが起きます。そこで `inserted_at` と、最後の決め手として主キー `id` を続けて指定し、どの投稿同士でも必ず順序が1つに定まるようにしています。
++
++2つ目は「次のページがあるか」の判定です。`limit: @page_size + 1` と、表示に必要な25件より **1件だけ多く** 取ります。26件目が取れたら「まだ続きがある」と分かり、取れなければ最終ページです。以前は「25件ちょうど取れたら続きがあるはず」と推測していたため、総数がちょうど25件のときに、空っぽの次ページへのボタンが出てしまう問題がありました。余った1件は `split_page/1` が表示分から落とし、真偽値だけを画面側に渡します。
++
+ ---
+ 
+ ## 4-5　投票ロジック
+@@ -163,19 +187,29 @@ def vote_post(user_id, post_id, value) when value in [1, -1] do
+     # パターンD: 自分の投稿には投票できない
+     {:error, :cannot_vote_own_post}
+   else
+-    existing_vote =
+-      Repo.get_by(Vote,
+-        user_id: user_id,
+-        target_type: "post",
+-        target_id: post_id
+-      )
+-
+     Repo.transaction(fn ->
++      # 既存の票はトランザクションの中で行ロックを取って読む。
++      # 外で読むと、同時に行われた変更・取り消しと競合して
++      # score と実際の票の合計がずれてしまう。
++      existing_vote = get_vote_for_update(user_id, "post", post_id)
++
+       process_vote(existing_vote, post, user_id, value)
+     end)
+   end
+ end
+ 
++# 既存の票を FOR UPDATE でロックして取得する（投票の競合防止）
++defp get_vote_for_update(user_id, target_type, target_id) do
++  from(v in Vote,
++    where:
++      v.user_id == ^user_id and
++        v.target_type == ^target_type and
++        v.target_id == ^target_id,
++    lock: "FOR UPDATE"
++  )
++  |> Repo.one()
++end
++
+ # パターンA: まだ投票していない → 新規投票
+ defp process_vote(nil, post, user_id, value) do
+   %Vote{}
+@@ -208,15 +242,40 @@ defp process_vote(%Vote{value: old_value} = vote, post, _user_id, new_value) do
+ end
+ 
+ # score と hot_score と karma を同時に更新する
++# score は SQL 側で加算し（inc）、hot_score も SQL の式で計算する。
++# 読み込んだ post.score に足して書き戻すと、別々のユーザーが同時に
++# 投票したときに一方の更新が消えてしまう（lost update）ため、
++# 1文の原子的な UPDATE にする。
++# hot_score の式は Post.compute_hot_score/2 と同じ
++# （sign * log10(max(abs(score), 1)) + 経過秒数 / 45000）。
++# PostgreSQL の log() は常用対数（底10）なので log10 として使える。
+ defp update_scores(post, score_diff, karma_diff) do
+-  new_score = post.score + score_diff
+-  new_hot   = Post.compute_hot_score(new_score, post.inserted_at)
++  epoch_seconds = DateTime.to_unix(~U[2005-12-08 07:46:43Z])
++
++  {1, [updated_post]} =
++    from(p in Post,
++      where: p.id == ^post.id,
++      select: p,
++      update: [
++        inc: [score: ^score_diff],
++        set: [
++          hot_score:
++            fragment(
++              "sign(? + ?) * log(greatest(abs(? + ?), 1)) + (extract(epoch from ?) - ?) / 45000.0",
++              p.score,
++              ^score_diff,
++              p.score,
++              ^score_diff,
++              p.inserted_at,
++              ^epoch_seconds
++            )
++        ]
++      ]
++    )
++    |> Repo.update_all([])
+ 
+-  updated_post =
+-    post
+-    |> Ecto.Changeset.change(score: new_score, hot_score: new_hot)
+-    |> Repo.update!()
+-    |> Repo.preload([:author, :subreddit])  # 投票後も author/subreddit を保持する
++  # 投票後も author/subreddit を保持する
++  updated_post = Repo.preload(updated_post, [:author, :subreddit])
+ 
+   # 投稿者のKarmaも更新
+   Accounts.update_karma(post.author_id, "post", karma_diff)
+@@ -261,6 +320,22 @@ end)
+ 
+ これら3つの操作はセットで成功・失敗しなければなりません。例えば votes の更新は成功したが score の更新が失敗すると、投票は記録されたのにスコアが変わらないという矛盾が生じます。トランザクションがこれを防ぎます。
+ 
++**読み解き（既存の票をロックして読む）**
++
++既存の票の取得は、トランザクションの外ではなく中で、`lock: "FOR UPDATE"` を付けて行っています。ここが競合対策の要です。
++
++トランザクションの外で票を読んで「変更なのか取り消しなのか」を判断してから書き込むと、その読み取りと書き込みの間に、別のリクエスト（別のタブや、同じユーザーの二重送信）が割り込む余地があります。たとえば「取り消し」が同時に2回届くと、両方とも「票がある」と読んでそれぞれ -1 ずつ引いてしまい、score が実際の票の合計とずれます。
++
++`FOR UPDATE` で行をロックして読むと、その票に対する次の読み取りは、前のトランザクションが終わるまで待たされます。「読む → 判断する → 更新する」が一続きになるため、2回目のリクエストは1回目の結果を見て正しく判断できます。
++
++**読み解き（スコアは SQL 側で足す）**
++
++`update_scores/3` は、読み込んだ `post.score` に Elixir 側で差分を足して書き戻す形にはしていません。`Repo.update_all` の `inc` で「今の値に差分を足す」という指示を DB に出し、`hot_score` も `fragment` で SQL の式として計算させています。
++
++「読んで、足して、書き戻す」形だと、別々のユーザーが同じ投稿へ同時に投票したとき、両方が同じ古い値を読んでしまい、後から書き込んだほうに上書きされて、一方の票がスコアに残りません（lost update）。DB の中で加算すれば、更新は1文の中で原子的（不可分）に行われるため、この取りこぼしが起きません。Karma の更新（4-2 の `update_karma/3`）が最初からこの形だったのと、考え方は同じです。
++
++`hot_score` の SQL 式は、第3章の `Post.compute_hot_score/2` と同じ計算です。`sign(新しいスコア) * log(...)` の部分と、投稿時刻から基準時刻を引いて 45000 で割る部分に分かれています。PostgreSQL の `log()` は常用対数（底10）なので、Elixir 側の `:math.log10` に対応します。基準時刻は `DateTime.to_unix/1` で Unix 秒に変えた値をパラメータとして渡しています。
++
+ ---
+ 
+ ## 4-6　投稿の削除
+diff --git a/tutorial/chapter_04c.md b/tutorial/chapter_04c.md
+index 2397236..d4fb926 100644
+--- a/tutorial/chapter_04c.md
++++ b/tutorial/chapter_04c.md
+@@ -15,9 +15,37 @@ defmodule RedditClone.Comments do
+ 
+   # コメントを作成する
+   def create_comment(attrs) do
+-    %Comment{}
+-    |> Comment.changeset(attrs)
+-    |> Repo.insert()
++    changeset = Comment.changeset(%Comment{}, attrs)
++
++    case validate_parent(changeset) do
++      :ok -> Repo.insert(changeset)
++      {:error, changeset} -> {:error, changeset}
++    end
++  end
++
++  # 返信先（parent_id）がある場合は、そのコメントが存在し、
++  # 同じ投稿へのコメントであることを確認する。
++  # parent_id はクライアントから送られてくる値なので、改ざんされたIDで
++  # 外部キーエラーになって落ちたり、別の投稿のコメントを親にして
++  # 表示されないコメントができたりするのを防ぐ。
++  defp validate_parent(changeset) do
++    case Ecto.Changeset.get_field(changeset, :parent_id) do
++      nil ->
++        :ok
++
++      parent_id ->
++        post_id = Ecto.Changeset.get_field(changeset, :post_id)
++
++        case Repo.get(Comment, parent_id) do
++          %Comment{post_id: ^post_id} ->
++            :ok
++
++          _ ->
++            changeset
++            |> Ecto.Changeset.add_error(:parent_id, "is invalid")
++            |> then(&{:error, &1})
++        end
++    end
+   end
+ 
+   # 投稿のコメントをツリー構造で取得する
+@@ -41,19 +69,28 @@ defmodule RedditClone.Comments do
+     if comment.author_id == user_id do
+       {:error, :cannot_vote_own_comment}
+     else
+-      existing_vote =
+-        Repo.get_by(Vote,
+-          user_id: user_id,
+-          target_type: "comment",
+-          target_id: comment_id
+-        )
+-
+       Repo.transaction(fn ->
++        # 既存の票はトランザクションの中で行ロックを取って読む
++        # （Posts.vote_post と同じ競合対策）
++        existing_vote = get_vote_for_update(user_id, "comment", comment_id)
++
+         process_vote(existing_vote, comment, user_id, value)
+       end)
+     end
+   end
+ 
++  # 既存の票を FOR UPDATE でロックして取得する（投票の競合防止）
++  defp get_vote_for_update(user_id, target_type, target_id) do
++    from(v in Vote,
++      where:
++        v.user_id == ^user_id and
++          v.target_type == ^target_type and
++          v.target_id == ^target_id,
++      lock: "FOR UPDATE"
++    )
++    |> Repo.one()
++  end
++
+   # コメントを削除する（本人またはモデレーターのみ）
+   def delete_comment(comment_id, user_id, subreddit_id) do
+     comment = get_comment!(comment_id)
+@@ -101,12 +138,18 @@ defmodule RedditClone.Comments do
+   end
+ 
+   # score と comment_karma を同時に更新する
++  # score は SQL 側で加算する（inc）。読み込んだ値に足して書き戻すと
++  # 同時投票で更新が消えてしまうため（Posts.update_scores と同じ対策）。
+   defp update_scores(comment, score_diff, karma_diff) do
+-    updated_comment =
+-      comment
+-      |> Ecto.Changeset.change(score: comment.score + score_diff)
+-      |> Repo.update!()
+-      |> Repo.preload([:author])  # 投票後も author を保持する
++    {1, [updated_comment]} =
++      from(c in Comment,
++        where: c.id == ^comment.id,
++        select: c
++      )
++      |> Repo.update_all(inc: [score: score_diff])
++
++    # 投票後も author を保持する
++    updated_comment = Repo.preload(updated_comment, [:author])
+ 
+     # コメント投稿者の comment_karma を更新
+     Accounts.update_karma(comment.author_id, "comment", karma_diff)
+@@ -139,6 +182,12 @@ defmodule RedditClone.Comments do
+ end
+ ```
+ 
++**読み解き**
++
++`create_comment/1` には、返信先の確認（`validate_parent/1`）が入っています。`parent_id` は画面のフォームから送られてくる値で、利用者が改ざんできてしまいます。もし存在しないコメントの ID が指定されたら外部キーエラーで落ちますし、別の投稿のコメントが指定されたら、その返信は親と違う投稿にぶら下がって、どちらの画面にも正しく表示されなくなります。そこで保存の前に「そのコメントが存在するか」「同じ投稿のコメントか」を確かめ、当てはまらなければ例外ではなくチェンジセットのエラー（`{:error, changeset}`）として返します。存在しない ID そのものについては、第3章で見た `foreign_key_constraint` も二重の備えになっています。
++
++コメントへの投票（`vote_comment/3` と `update_scores/3`）は、中編の投稿投票とまったく同じ競合対策です。既存の票はトランザクションの中で `FOR UPDATE` のロックを取って読み、スコアは `Repo.update_all(inc: ...)` で DB 側で加算します。
++
+ ---
+ 
+ ## 4-8　ツリー組み立てのアルゴリズム
+diff --git a/tutorial/chapter_06a.md b/tutorial/chapter_06a.md
+index f3396ec..38c2c13 100644
+--- a/tutorial/chapter_06a.md
++++ b/tutorial/chapter_06a.md
+@@ -138,7 +138,7 @@ defmodule RedditCloneWeb.SubredditLive do
+          |> redirect(to: "/")}
+ 
+       subreddit ->
+-        posts   = Posts.list_posts(subreddit.id, "hot", 1)
++        {posts, has_more?} = Posts.list_posts(subreddit.id, "hot", 1)
+         joined? = joined?(socket.assigns.current_user, subreddit.id)
+ 
+         {:ok,
+@@ -148,7 +148,7 @@ defmodule RedditCloneWeb.SubredditLive do
+          |> assign(:posts, posts)
+          |> assign(:sort, "hot")
+          |> assign(:page, 1)
+-         |> assign(:has_more?, length(posts) == 25)
++         |> assign(:has_more?, has_more?)
+          |> assign(:report_modal, nil)
+          |> assign(:joined?, joined?)}
+     end
+@@ -161,13 +161,13 @@ defmodule RedditCloneWeb.SubredditLive do
+   @impl true
+   def handle_event("sort", %{"value" => sort}, socket) do
+     # ソート切り替え時はページを1に戻す
+-    posts = Posts.list_posts(socket.assigns.subreddit.id, sort, 1)
++    {posts, has_more?} = Posts.list_posts(socket.assigns.subreddit.id, sort, 1)
+ 
+     {:noreply,
+      socket
+      |> assign(:sort, sort)
+      |> assign(:page, 1)
+-     |> assign(:has_more?, length(posts) == 25)
++     |> assign(:has_more?, has_more?)
+      |> assign(:posts, posts)}
+   end
+ 
+@@ -205,13 +205,13 @@ defmodule RedditCloneWeb.SubredditLive do
+   end
+ 
+   def handle_event("load_more", _params, socket) do
+-    next_page  = socket.assigns.page + 1
+-    new_posts  = Posts.list_posts(socket.assigns.subreddit.id, socket.assigns.sort, next_page)
++    next_page          = socket.assigns.page + 1
++    {new_posts, has_more?} = Posts.list_posts(socket.assigns.subreddit.id, socket.assigns.sort, next_page)
+ 
+     {:noreply,
+      socket
+      |> assign(:page, next_page)
+-     |> assign(:has_more?, length(new_posts) == 25)
++     |> assign(:has_more?, has_more?)
+      |> assign(:posts, socket.assigns.posts ++ new_posts)}  # 既存に追記
+   end
+ 
+@@ -435,10 +435,10 @@ end
+ `has_more?` でページネーションを管理します。
+ 
+ ```elixir
+-assign(:has_more?, length(posts) == 25)
++{posts, has_more?} = Posts.list_posts(subreddit.id, "hot", 1)
+ ```
+ 
+-取得件数がページサイズ（25件）と一致するとき、まだ次のページがあると判断します。25件未満なら最後のページです。
++「次のページがあるか」は、画面側が件数を数えて推測するのではなく、第4章で見たとおり Context が「26件目があるか」で判定して一緒に返します。総数がちょうど25件のときでも、空の次ページへのボタンは出ません。
+ 
+ `load_more` は取得した投稿を既存のリストに追記します。
+ 
+diff --git a/tutorial/chapter_06c.md b/tutorial/chapter_06c.md
+index d6dc921..c6b3096 100644
+--- a/tutorial/chapter_06c.md
++++ b/tutorial/chapter_06c.md
+@@ -28,7 +28,7 @@ defmodule RedditCloneWeb.HomeFeedLive do
+   def mount(_params, _session, socket) do
+     user = socket.assigns.current_user
+ 
+-    posts            = Posts.list_home_posts(user.id, "hot", 1)
++    {posts, has_more?} = Posts.list_home_posts(user.id, "hot", 1)
+     joined_subreddits = Communities.list_joined_subreddits(user.id)
+ 
+     {:ok,
+@@ -37,7 +37,7 @@ defmodule RedditCloneWeb.HomeFeedLive do
+      |> assign(:posts, posts)
+      |> assign(:sort, "hot")
+      |> assign(:page, 1)
+-     |> assign(:has_more?, length(posts) == 25)
++     |> assign(:has_more?, has_more?)
+      |> assign(:joined_subreddits, joined_subreddits)
+      |> assign(:report_modal, nil)}
+   end
+@@ -48,26 +48,26 @@ defmodule RedditCloneWeb.HomeFeedLive do
+ 
+   @impl true
+   def handle_event("sort", %{"value" => sort}, socket) do
+-    user  = socket.assigns.current_user
+-    posts = Posts.list_home_posts(user.id, sort, 1)
++    user           = socket.assigns.current_user
++    {posts, has_more?} = Posts.list_home_posts(user.id, sort, 1)
+ 
+     {:noreply,
+      socket
+      |> assign(:sort, sort)
+      |> assign(:page, 1)
+-     |> assign(:has_more?, length(posts) == 25)
++     |> assign(:has_more?, has_more?)
+      |> assign(:posts, posts)}
+   end
+ 
+   def handle_event("load_more", _params, socket) do
+-    user      = socket.assigns.current_user
+-    next_page = socket.assigns.page + 1
+-    new_posts = Posts.list_home_posts(user.id, socket.assigns.sort, next_page)
++    user               = socket.assigns.current_user
++    next_page          = socket.assigns.page + 1
++    {new_posts, has_more?} = Posts.list_home_posts(user.id, socket.assigns.sort, next_page)
+ 
+     {:noreply,
+      socket
+      |> assign(:page, next_page)
+-     |> assign(:has_more?, length(new_posts) == 25)
++     |> assign(:has_more?, has_more?)
+      |> assign(:posts, socket.assigns.posts ++ new_posts)}
+   end
+ 
+@@ -313,7 +313,7 @@ defmodule RedditCloneWeb.ProfileLive do
+          |> redirect(to: "/")}
+ 
+       profile_user ->
+-        posts = Posts.list_user_posts(profile_user.id, 1)
++        {posts, has_more?} = Posts.list_user_posts(profile_user.id, 1)
+ 
+         {:ok,
+          socket
+@@ -321,7 +321,7 @@ defmodule RedditCloneWeb.ProfileLive do
+          |> assign(:profile_user, profile_user)
+          |> assign(:posts, posts)
+          |> assign(:page, 1)
+-         |> assign(:has_more?, length(posts) == 25)
++         |> assign(:has_more?, has_more?)
+          |> assign(:report_modal, nil)}
+     end
+   end
+@@ -332,13 +332,13 @@ defmodule RedditCloneWeb.ProfileLive do
+ 
+   @impl true
+   def handle_event("load_more", _params, socket) do
+-    next_page = socket.assigns.page + 1
+-    new_posts = Posts.list_user_posts(socket.assigns.profile_user.id, next_page)
++    next_page          = socket.assigns.page + 1
++    {new_posts, has_more?} = Posts.list_user_posts(socket.assigns.profile_user.id, next_page)
+ 
+     {:noreply,
+      socket
+      |> assign(:page, next_page)
+-     |> assign(:has_more?, length(new_posts) == 25)
++     |> assign(:has_more?, has_more?)
+      |> assign(:posts, socket.assigns.posts ++ new_posts)}
+   end
+ 
+diff --git a/tutorial/index.md b/tutorial/index.md
+index b7cf494..67c3a8a 100644
+--- a/tutorial/index.md
++++ b/tutorial/index.md
+@@ -33,7 +33,7 @@
+ 
+ | ファイル | 内容 |
+ |---------|------|
+-| [全コード付録 1 データ層](appendix_code_01_data.md) | マイグレーション7＋スキーマ7の全文（第2〜3章） |
++| [全コード付録 1 データ層](appendix_code_01_data.md) | マイグレーション8＋スキーマ7の全文（第2〜3章） |
+ | [全コード付録 2 Context 層](appendix_code_02_contexts.md) | Context 5ファイルの全文（第4章） |
+ | [全コード付録 3 Web 層](appendix_code_03_web.md) | 認証5＋LiveView・コンポーネント等12ファイルの全文（第5〜8章） |
+ | [全コード付録 4 設定](appendix_code_04_config.md) | mix.exs の全文と、第1章で扱う repo.ex / config の本文掲載分（第1章） |
+@@ -51,6 +51,7 @@
+ | [create_comments](../migrations/20240001000004_create_comments.exs) | comments テーブル |
+ | [create_votes](../migrations/20240001000005_create_votes.exs) | votes テーブル |
+ | [create_reports](../migrations/20240001000006_create_reports.exs) | reports テーブル |
++| [case_insensitive_uniqueness](../migrations/20240001000007_case_insensitive_uniqueness.exs) | 大文字小文字を区別しない一意インデックス（方式B） |
+ 
+ ---
+ 
+@@ -122,15 +123,15 @@
+ 
+ ```
+ チュートリアル  18ファイル
+-マイグレーション  7ファイル
++マイグレーション  8ファイル
+ スキーマ          7ファイル
+ Context           5ファイル
+ 認証              5ファイル
+ LiveView          7ファイル
+ コンポーネント    5ファイル
+ ─────────────────────────
+-合計             54ファイル
++合計             55ファイル
+ ```
+ 
+-※ 上の内訳54ファイルに、この index.md 自身と mix.exs を加えると、全56ファイルになります。
+-※ 全コード付録の4ファイル（appendix_code_01〜04）は、上のコード37ファイルの「再録」です。二重に数えることを避けるため、上の合計には含めていません。ファイルの実数としては、チュートリアルのフォルダにこの4ファイルが加わり、全60ファイル（56＋4）になります。
++※ 上の内訳55ファイルに、この index.md 自身と mix.exs を加えると、全57ファイルになります。
++※ 全コード付録の4ファイル（appendix_code_01〜04）は、上のコード38ファイルの「再録」です。二重に数えることを避けるため、上の合計には含めていません。ファイルの実数としては、チュートリアルのフォルダにこの4ファイルが加わり、全61ファイル（57＋4）になります。

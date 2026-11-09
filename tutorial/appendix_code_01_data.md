@@ -297,9 +297,17 @@ defmodule RedditClone.Posts.Post do
 
   def compute_hot_score(score, inserted_at) do
     epoch = ~U[2005-12-08 07:46:43Z]
+
+    sign =
+      cond do
+        score > 0 -> 1
+        score < 0 -> -1
+        true -> 0
+      end
+
     order = :math.log10(max(abs(score), 1))
     seconds = DateTime.diff(inserted_at, epoch)
-    order + seconds / 45_000
+    sign * order + seconds / 45_000
   end
 end
 ```

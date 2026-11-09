@@ -67,9 +67,17 @@ defmodule RedditClone.Posts.Post do
 
   def compute_hot_score(score, inserted_at) do
     epoch = ~U[2005-12-08 07:46:43Z]
+
+    sign =
+      cond do
+        score > 0 -> 1
+        score < 0 -> -1
+        true -> 0
+      end
+
     order = :math.log10(max(abs(score), 1))
     seconds = DateTime.diff(inserted_at, epoch)
-    order + seconds / 45_000
+    sign * order + seconds / 45_000
   end
 end
 ```
@@ -84,13 +92,16 @@ end
 
 `case` の最後の節 `_ ->` は「どれにも当てはまらなかった場合」を受け止める受け皿です。`type` が想定外の値でも落ちずにチェンジセットをそのまま返します。なお、想定外の `type` 自体は、その手前の `validate_inclusion(:type, @valid_types)` がエラーとして記録しています。
 
-`compute_hot_score/2` は Reddit のオリジナルアルゴリズムをシンプルにしたものです。
+`compute_hot_score/2` は Reddit のオリジナルアルゴリズム（Hot ランキングの式）です。
 
 ```elixir
-order = :math.log10(max(abs(score), 1))  # スコアの対数（急激な差をなだらかにする）
-seconds = DateTime.diff(inserted_at, epoch)  # 基準時刻からの秒数
-order + seconds / 45_000                 # 時間経過で自然に下がる
+# sign はスコアの符号（正なら 1、負なら -1、0 なら 0）
+order = :math.log10(max(abs(score), 1))       # スコアの絶対値の対数（急激な差をなだらかにする）
+seconds = DateTime.diff(inserted_at, epoch)   # 基準時刻からの秒数
+sign * order + seconds / 45_000               # 時間経過で自然に下がる
 ```
+
+符号（`sign`）が付いているのが要点です。スコアが負の投稿は `sign * order` がマイナスになるため順位が下がり、「下げ票で沈む」という Reddit 本来の動きになります。符号が無いと、スコアが -50 の投稿と +50 の投稿が同じ大きさで扱われてしまいます。
 
 投稿されてから時間が経つほど `hot_score` が相対的に下がり、新しい投稿が上位に来やすくなります。
 
